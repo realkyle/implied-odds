@@ -1,0 +1,34 @@
+# Build outputs
+build/
+dist/
+*.egg-info/
+_skbuild/
+compile_commands.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Recorded market data (large, regenerable only by recording)
+data/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Personal working files (kept local for now)
+CLAUDE.md
+addon.md
+docs/WorkLog.md
+docs/CodeGuide.md
+.claude/settings.local.json
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
