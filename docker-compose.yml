@@ -1,0 +1,20 @@
+# Stage 1: Redis only. Stage 1.5 adds the recorders, writer and monitoring.
+services:
+  redis:
+    image: redis:7.4.1-alpine
+    # AOF ("append-only file") persistence: every write is logged to disk and fsynced
+    # each second, so a Redis crash loses at most ~1 s of queued messages.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:6379:6379"   # local machine only, never exposed to the network
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis-data:
