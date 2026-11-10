@@ -1,0 +1,35 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ppm"
+version = "0.1.0"
+description = "Pricing prediction markets with the options market"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []  # runtime deps are added with the features that need them
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["python/ppm"]
+
+[tool.scikit-build.cmake.define]
+PPM_BUILD_PYTHON = "ON"
+PPM_BUILD_TESTS = "OFF"
+PPM_BUILD_BENCH = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["python/ppm/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
