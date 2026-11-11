@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Interim laptop runner for the Phase 0 recorders (replaced by docker compose in Stage 1.5).
+# Laptop runner for the recorders, used until the cloud VM takes over. Elsewhere use
+# `docker compose up -d` (same services, with automatic restarts); containers can't keep a
+# Mac awake, so the laptop keeps this script and `caffeinate`.
 #
 #   scripts/recording.sh start    start Redis, the writer and every recorder, detached
 #   scripts/recording.sh stop     stop them cleanly (SIGTERM: each finishes its current step)

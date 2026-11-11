@@ -1,4 +1,33 @@
-# Stage 1: Redis only. Stage 1.5 adds the recorders, writer and monitoring.
+# Every ppm service: Redis, the writer and one recorder process per venue.
+#
+#   docker compose up -d --build     build the image and start everything
+#   docker compose ps                status (restarts, uptime)
+#   docker compose logs -f kalshi    follow one service's log
+#   docker compose down              stop everything (data and the Redis volume are kept)
+#
+# Laptop and VM run this same file. Host paths and the Redis port can be changed with
+# PPM_HOST_DATA, PPM_HOST_SPOOL and PPM_REDIS_PORT (used to test a second stack).
+
+x-ppm: &ppm
+  build: .
+  image: ppm:latest
+  environment:
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - ${PPM_HOST_DATA:-./data}:/data
+    - ${PPM_HOST_SPOOL:-./spool}:/spool
+  depends_on:
+    redis:
+      condition: service_healthy
+  # A crashed process is restarted by Docker; `unless-stopped` also brings every
+  # service back after the VM reboots.
+  restart: unless-stopped
+  init: true # tiny init as PID 1: forwards SIGTERM, reaps zombie processes
+  stop_grace_period: 30s # time to finish the current step after SIGTERM
+  logging: &logging
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" } # cap log disk use per service
+
 services:
   redis:
     image: redis:7.4.1-alpine
@@ -6,15 +35,40 @@ services:
     # each second, so a Redis crash loses at most ~1 s of queued messages.
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
-      - "127.0.0.1:6379:6379"   # local machine only, never exposed to the network
+      - "127.0.0.1:${PPM_REDIS_PORT:-6379}:6379" # this machine only, never the network
     volumes:
       - redis-data:/data
     restart: unless-stopped
+    logging: *logging
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 3
+
+  writer:
+    <<: *ppm
+    command: ["writer"]
+
+  deribit:
+    <<: *ppm
+    command: ["record", "deribit"]
+
+  kalshi:
+    <<: *ppm
+    command: ["record", "kalshi"]
+
+  polymarket:
+    <<: *ppm
+    command: ["record", "polymarket"]
+
+  reference:
+    <<: *ppm
+    command: ["record", "reference"]
+
+  settlements:
+    <<: *ppm
+    command: ["record", "settlements"]
 
 volumes:
   redis-data:

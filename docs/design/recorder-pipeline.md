@@ -81,7 +81,7 @@ Envelope. These are Redis stream fields; all are strings, as Redis requires:
 | `recv_ts` | `1794330000233` | Local time the response arrived (latency = recv − request) |
 | `status` | `200` | HTTP status code, or `error` for network failures |
 | `params` | `{"currency":"BTC","kind":"option"}` | Request parameters; with `endpoint` they form the envelope **key** (`book_summary-BTC-option`) |
-| `enc` | `gzip` | `identity`, or `gzip` when the body is over 64 KB |
+| `enc` | `gzip` | `gzip` for every non-empty body (since 2026-11-11; before that only bodies over 64 KB), `identity` for empty bodies and older files |
 | `body` | bytes | Raw response body, stored as binary (Redis values are binary-safe, so no base64), or the error text when `status` is not 200 |
 
 ## 4. Parquet tables (the data contract)

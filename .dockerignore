@@ -1,0 +1,17 @@
+# Keep the build context small and free of local state and secrets.
+.git
+.venv
+build
+data
+spool
+run
+logs
+infra
+**/__pycache__
+**/.pytest_cache
+.ruff_cache
+.env
+.env.*
+CLAUDE.md
+addon.md
+docs

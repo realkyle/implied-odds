@@ -44,7 +44,9 @@ surface, and tests whether the gaps survive fees, hedging costs and the venues' 
 | Reference prices: Binance 1m candles (Polymarket's settlement), Coinbase (BRTI proxy) | ✅ Recording |
 | Settlement collector: Kalshi results + actual BRTI values, Polymarket resolutions, Binance settlement candles | ✅ Running hourly |
 | Daily merge + hash-chained manifest, failure/kill tests | 🔨 Next |
-| Docker Compose for all services, Prometheus/Grafana, alerts, cloud VM (Terraform) | 📋 Planned |
+| Docker image + Compose for every service, with restart policies; kill-tested | ✅ Built |
+| Cloud VM (Terraform, AWS Lightsail) + nightly S3 backup | 🔨 Next |
+| Prometheus/Grafana, health checks, alerts | 📋 Planned |
 | C++ pricing core: Black-76, IV solver, SVI/SSVI fit, arbitrage checks, skew-corrected digitals | 📋 Planned |
 | Contract matching, divergence analysis, calibration, backtest with costs | 📋 Planned |
 
@@ -102,6 +104,7 @@ All numbers below were measured on a laptop and are recorded in the project log.
 | Fetch latency (median) | Deribit 343 ms · Kalshi ~350 ms · Polymarket 364 ms |
 | Alignment within a Deribit snapshot | All 6 responses within 11–65 ms of each other |
 | Writer crash recovery | 18 queued snapshots drained in < 8 s, 0 lost, 0 duplicated |
+| Writer SIGKILL under Docker Compose | Restarted in 0.9 s; 146/146 messages written exactly once |
 | Rows quarantined in live runs | 0 |
 | Polymarket range-ladder sanity check | Mid prices sum to 1.024 (≈ 1 plus the bid-ask spread) |
 | Settlement cross-check | All 22 resolved Polymarket BTC contracts on 2026-11-10 agree with the Binance noon close and our bracket rules |
@@ -114,7 +117,7 @@ Not yet measured: kill and network-cut tests under load, Redis outage replay, an
 
 - **Python 3.11:** asyncio + httpx, Redis Streams (redis-py), Apache Arrow / Parquet (pyarrow), pytest, ruff, uv
 - **C++20:** core library exposed to Python with pybind11; CMake presets, GoogleTest, Google Benchmark
-- **Infra:** Docker Compose (Redis with AOF), GitHub Actions CI on Ubuntu and macOS; planned: Prometheus, Grafana, Terraform
+- **Infra:** Docker (multi-stage image) and Docker Compose, Redis with AOF, GitHub Actions CI on Ubuntu and macOS; next: Terraform on AWS (Lightsail + S3); planned: Prometheus, Grafana
 
 ## Repository layout
 
@@ -136,9 +139,10 @@ scripts/recording.sh  start / stop / status for local recording
 uv sync && uv run pytest                    # Python tests (also builds the C++ extension)
 cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # C++ tests
 
-scripts/recording.sh start                  # Redis + writer + all recorders, detached
-scripts/recording.sh status                 # processes, queue lag, latest log lines
-scripts/recording.sh stop
+docker compose up -d --build               # Redis + writer + every recorder, auto-restarting
+docker compose ps                           # status and restart counts
+docker compose logs -f kalshi               # one service's log
+docker compose down                         # stop (data and the Redis volume are kept)
 ```
 
 All venue data used is public; no API keys are needed.
