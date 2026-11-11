@@ -35,3 +35,7 @@ docs/CodeGuide.md
 
 # Recorder spool (envelopes buffered while Redis is unreachable)
 spool/
+
+# Interim laptop runner state
+run/
+logs/

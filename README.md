@@ -6,7 +6,7 @@ A Kalshi or Polymarket contract such as "BTC above $95,000 at 5pm ET" pays $1 or
 digital option. This project fits an arbitrage-free volatility surface to Deribit BTC options, computes
 the options-implied price of each such contract, and compares the two.
 
-**Status:** Phase 0 (data recording) in progress. Built so far: a fault-tolerant recording pipeline (venue recorder processes → Redis Streams → Parquet writer) with Deribit BTC/ETH options as the first venue. Kalshi, Polymarket and the pricing library are not built yet.
+**Status:** Phase 0 (data recording) in progress. Built so far: a fault-tolerant recording pipeline (venue recorder processes → Redis Streams → Parquet writer) recording Deribit BTC/ETH options, Kalshi BTC/ETH price contracts and reference spot prices (Binance, Coinbase). Polymarket, the settlement collector and the pricing library are not built yet.
 
 ## Stack
 
@@ -27,6 +27,8 @@ At-least-once delivery plus idempotent writes means a crash of any component los
 docker compose up -d redis
 uv run ppm writer            # one terminal
 uv run ppm record deribit    # another terminal
+
+scripts/recording.sh start   # or: run everything detached (status / stop)
 ```
 
 ## Build and test

@@ -103,3 +103,33 @@ async def test_late_wakeup_skips_the_tick_instead_of_mislabelling_data(redis, tm
     rec = DeribitRecorder(client, RedisBus(redis, DiskSpool(tmp_path, 10**8), 1000), clock=clock)
     await asyncio.wait_for(rec.run_forever(stop), timeout=5)
     assert calls == 0 and await published(redis) == []
+
+
+async def test_kalshi_and_reference_fetch_specs():
+    from ppm.recorders.kalshi import KalshiRecorder
+    from ppm.recorders.reference import ReferenceRecorder
+
+    keys = {}
+    for cls in (KalshiRecorder, ReferenceRecorder):
+        specs = await cls(client=None, bus=None).fetch_specs()  # type: ignore[arg-type]
+        keys[cls.venue] = sorted(
+            make_key(s.endpoint, s.params)
+            for s in specs  # same rule the envelope uses
+        )
+    assert keys["kalshi"] == [
+        "markets-KXBTC",
+        "markets-KXBTCD",
+        "markets-KXETH",
+        "markets-KXETHD",
+    ]
+    assert keys["reference"] == [
+        "binance_klines-BTCUSDT",
+        "binance_klines-ETHUSDT",
+        "coinbase_ticker-BTC_USD",
+        "coinbase_ticker-ETH_USD",
+    ]
+
+
+def make_key(endpoint: str, params: dict[str, str]) -> str:
+    env = Envelope("v", endpoint, 0, 0, 0, "200", b"", dict(params))
+    return env.key

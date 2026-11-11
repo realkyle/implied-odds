@@ -1,6 +1,6 @@
 """Command-line entry points.
 
-ppm record deribit    run one venue recorder (one OS process per venue)
+ppm record <venue>    run one venue recorder (one OS process per venue)
 ppm writer            run the Parquet writer
 """
 
@@ -19,10 +19,14 @@ from ppm.config import Settings
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer
 from ppm.recorders.base import Recorder
 from ppm.recorders.deribit import DeribitRecorder
+from ppm.recorders.kalshi import KalshiRecorder
+from ppm.recorders.reference import ReferenceRecorder
 from ppm.writer.storage import DataStore
 from ppm.writer.writer import Writer
 
-RECORDERS: dict[str, type[Recorder]] = {"deribit": DeribitRecorder}
+RECORDERS: dict[str, type[Recorder]] = {
+    r.venue: r for r in (DeribitRecorder, KalshiRecorder, ReferenceRecorder)
+}
 
 
 def _configure_logging() -> None:
@@ -30,6 +34,9 @@ def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)sZ %(levelname)s %(name)s: %(message)s"
     )
+    # httpx logs every request at INFO (thousands of lines a day); failures are
+    # already logged by the recorder with their cause.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _stop_event() -> asyncio.Event:

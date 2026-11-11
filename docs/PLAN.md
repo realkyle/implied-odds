@@ -162,10 +162,10 @@ About 10 weeks part-time. Phase 0 starts immediately because the dataset grows w
 ### Phase 0 — Recorder (week 1)
 
 - [x] Repo skeleton, `pyproject.toml`, linting, CI stub
-- [ ] Deribit recorder: full BTC + ETH option chains + index + futures/perpetual, every 60 s
-- [ ] Kalshi recorder: open KXBTCD / KXBTC / KXETHD / KXETH markets, top-of-book and last trade
+- [x] Deribit recorder: full BTC + ETH option chains + index + futures/perpetual, every 60 s
+- [x] Kalshi recorder: open KXBTCD / KXBTC / KXETHD / KXETH markets, top-of-book and last trade (depth needs the authenticated websocket)
 - [ ] Polymarket recorder: BTC/ETH "above" and "price on" ladders, CLOB top of book and depth
-- [ ] Reference prices: Binance BTC/USDT 1m candle (Polymarket's settlement source), Coinbase BTC-USD (BRTI proxy)
+- [x] Reference prices: Binance BTC/USDT 1m candle (Polymarket's settlement source), Coinbase BTC-USD (BRTI proxy)
 - [ ] Settlement collector: Kalshi results and settlement values, Polymarket outcomes, Binance close at each settle time
 - [ ] Common schema, one Parquet file per venue per day, UTC timestamps
 - [ ] Runs unattended (cron, systemd or a small cloud VM) with logging and restart
@@ -175,11 +175,11 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 **Systems work (agreed 2026-11-10; design in `docs/design/recorder-pipeline.md`).** Each item is proven by a failure test and one measured number in the WorkLog.
 
 *Stage 1: pipeline (REST polling)*
-- [ ] One process per venue, so one venue failing never stops the others
-- [ ] Recorders publish to Redis Streams; a separate writer consumes into Parquet
+- [x] One process per venue, so one venue failing never stops the others
+- [x] Recorders publish to Redis Streams; a separate writer consumes into Parquet
 - [ ] Idempotent writes: a replayed message never creates a duplicate row
 - [ ] Exchange timestamp and local receive timestamp on every row; per-venue clock skew and latency logged
-- [ ] Schema validation on write; bad rows go to a quarantine file
+- [x] Schema validation on write; bad rows go to a quarantine file
 - [ ] Backpressure: bounded buffers when Redis or the writer falls behind, a writer-lag alert, and a slow-writer test
 - [ ] Daily hash chain: manifest of SHA-256(file + previous hash), verified before analysis; tampering test
 - [ ] Failure test: kill each recorder and the writer mid-run and cut the network; zero lost or duplicated rows; recovery time recorded
