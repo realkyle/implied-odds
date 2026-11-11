@@ -37,3 +37,14 @@ jobs:
       - run: uv run pytest
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+
+  docker:
+    name: Docker image (x86_64, like the VM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ppm:ci .
+      # The image must start and load the compiled C++ extension.
+      - run: docker run --rm ppm:ci --help
+      - run: docker run --rm --entrypoint python ppm:ci -c "import ppm_core; print(ppm_core.version())"
+      - run: docker compose config --quiet

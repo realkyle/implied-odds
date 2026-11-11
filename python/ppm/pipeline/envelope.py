@@ -14,9 +14,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 ENVELOPE_VERSION = 1
-# Bodies above this are gzip-compressed on the wire and on disk. A Deribit option
-# chain is ~0.5 MB of JSON, which compresses roughly 8x.
-GZIP_THRESHOLD_BYTES = 64 * 1024
+# Every non-empty body is gzip-compressed on the wire and on disk. Until 2026-11-11 only
+# bodies over 64 KB were, which left ~15 KB Polymarket books uncompressed (~460 MB/day);
+# measured ratios: Polymarket books 4.7x, Deribit chains 10.6x, Kalshi 43x, and even
+# 200-byte tickers 1.2x. Older files say `identity` in their header and still decode.
 STATUS_ERROR = "error"
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9_.]+")
 
@@ -121,7 +122,7 @@ def _text(value: bytes | str) -> str:
 
 
 def _compress(body: bytes) -> tuple[bytes, str]:
-    if len(body) > GZIP_THRESHOLD_BYTES:
+    if body:
         return gzip.compress(body, compresslevel=6), "gzip"
     return body, "identity"
 

@@ -185,7 +185,8 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 - [ ] Failure test: kill each recorder and the writer mid-run and cut the network; zero lost or duplicated rows; recovery time recorded
 
 *Stage 1.5: operations*
-- [ ] Dockerfile per service + docker-compose (recorders, Redis, writer, monitoring), restart policies, health checks
+- [x] Dockerfile + docker-compose for every service (one image, one service per process), restart policies; writer SIGKILL test: back in 0.9 s, 0 lost / 0 duplicated
+- [ ] Health checks per service + monitoring containers (with Prometheus)
 - [ ] Prometheus metrics (messages/s, last-message age, gaps, writer lag, reconnects) + Grafana dashboard
 - [ ] Alert when a venue has been silent longer than a threshold
 - [ ] Data-quality checks: stale quotes, crossed books, out-of-order timestamps, outliers; share caught per venue and day
