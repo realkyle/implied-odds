@@ -6,7 +6,7 @@ A Kalshi or Polymarket contract such as "BTC above $95,000 at 5pm ET" pays $1 or
 digital option. This project fits an arbitrage-free volatility surface to Deribit BTC options, computes
 the options-implied price of each such contract, and compares the two.
 
-**Status:** Phase 0 (data recording) in progress. Built so far: a fault-tolerant recording pipeline (venue recorder processes → Redis Streams → Parquet writer) recording Deribit BTC/ETH options, Kalshi BTC/ETH price contracts and reference spot prices (Binance, Coinbase). Polymarket, the settlement collector and the pricing library are not built yet.
+**Status:** Phase 0 (data recording) in progress. Built so far: a fault-tolerant recording pipeline (venue recorder processes → Redis Streams → Parquet writer) recording Deribit BTC/ETH options, Kalshi and Polymarket BTC/ETH price contracts, and reference spot prices (Binance, Coinbase). The settlement collector and the pricing library are not built yet.
 
 ## Stack
 

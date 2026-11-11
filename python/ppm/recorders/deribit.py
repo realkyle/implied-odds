@@ -15,7 +15,7 @@ class DeribitRecorder(Recorder):
     venue = "deribit"
     currencies: tuple[str, ...] = ("BTC", "ETH")
 
-    async def fetch_specs(self) -> list[FetchSpec]:
+    async def fetch_specs(self, snapshot_ts: int) -> list[FetchSpec]:
         specs: list[FetchSpec] = []
         for currency in self.currencies:
             for kind in ("option", "future"):

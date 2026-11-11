@@ -297,3 +297,120 @@ def parse_coinbase_ticker(env: Envelope) -> ParseResult:
         },
     )
     return out
+
+
+# --- Polymarket ------------------------------------------------------------------
+
+POLYMARKET_SLUG_ASSET = {"bitcoin": "BTC", "ethereum": "ETH"}
+# groupItemTitle: "66,000" (above ladder), "<68,000", ">86,000", "68,000-70,000"
+_PM_TITLE_RE = re.compile(r"^(?P<op>[<>])?(?P<low>[\d,.]+)(?:-(?P<high>[\d,.]+))?$")
+BOOK_DEPTH = 5
+
+
+def _pm_asset(slug: str) -> str | None:
+    return POLYMARKET_SLUG_ASSET.get(slug.split("-")[0])
+
+
+def _pm_strikes(slug: str, title: str) -> tuple[str, float | None, float | None] | None:
+    """(contract_type, strike_low, strike_high) from the event slug and bracket title."""
+    m = _PM_TITLE_RE.match(title.replace(" ", ""))
+    if not m:
+        return None
+    low = float(m["low"].replace(",", ""))
+    if m["high"]:
+        return "range", low, float(m["high"].replace(",", ""))
+    if m["op"] == "<":
+        return "below", None, low
+    if m["op"] == ">" or "-above-on-" in slug:
+        return "above", low, None
+    return None
+
+
+@parser("polymarket", "events")
+def parse_polymarket_events(env: Envelope) -> ParseResult:
+    out = ParseResult()
+    for event in json.loads(env.body):
+        slug = event["slug"]
+        for m in event.get("markets", []):
+            asset = _pm_asset(slug)
+            strikes = _pm_strikes(slug, m.get("groupItemTitle", ""))
+            if asset is None or strikes is None:
+                reason = f"unrecognised contract {slug!r} / {m.get('groupItemTitle')!r}"
+                out.reject("polymarket_contracts", m, reason)
+                continue
+            outcomes = json.loads(m["outcomes"])
+            tokens = json.loads(m["clobTokenIds"])
+            if sorted(outcomes) != ["No", "Yes"] or len(tokens) != 2:
+                out.reject("polymarket_contracts", m, f"unexpected outcomes {outcomes!r}")
+                continue
+            yes = outcomes.index("Yes")
+            kind, low, high = strikes
+            schedule = m.get("feeSchedule")
+            out.add(
+                "polymarket_contracts",
+                {
+                    "snapshot_ts": env.snapshot_ts,
+                    "recv_ts": env.recv_ts,
+                    "exchange_ts": None,
+                    "asset": asset,
+                    "yes_token_id": tokens[yes],
+                    "no_token_id": tokens[1 - yes],
+                    "condition_id": m.get("conditionId"),
+                    "event_slug": slug,
+                    "question": m.get("question"),
+                    "contract_type": kind,
+                    "strike_low": low,
+                    "strike_high": high,
+                    "settle_ts": _iso_ms(m.get("endDate")),
+                    "closed": m.get("closed"),
+                    "fees_enabled": m.get("feesEnabled"),
+                    "fee_type": m.get("feeType"),
+                    "fee_schedule": json.dumps(schedule, sort_keys=True) if schedule else None,
+                    "tick_size": _num(m.get("orderPriceMinTickSize")),
+                    "min_order_size": _num(m.get("orderMinSize")),
+                    "neg_risk": m.get("negRisk"),
+                },
+            )
+    return out
+
+
+def _levels(raw: list[dict[str, str]], best_first_desc: bool) -> list[dict[str, float]]:
+    """Order-book levels sorted best first. The CLOB sends bids ascending and asks
+    descending (best price LAST), so never trust the order it arrives in."""
+    levels = [{"price": float(x["price"]), "size": float(x["size"])} for x in raw]
+    return sorted(levels, key=lambda lv: lv["price"], reverse=best_first_desc)
+
+
+@parser("polymarket", "books")
+def parse_polymarket_books(env: Envelope) -> ParseResult:
+    slug = env.params["slug"]
+    asset = _pm_asset(slug)
+    out = ParseResult()
+    for book in json.loads(env.body):
+        if asset is None:
+            out.reject("polymarket_books", book, f"unknown asset in slug {slug!r}")
+            continue
+        bids = _levels(book.get("bids") or [], best_first_desc=True)
+        asks = _levels(book.get("asks") or [], best_first_desc=False)
+        out.add(
+            "polymarket_books",
+            {
+                "snapshot_ts": env.snapshot_ts,
+                "recv_ts": env.recv_ts,
+                "exchange_ts": int(book["timestamp"]) if book.get("timestamp") else None,
+                "asset": asset,
+                "yes_token_id": book.get("asset_id"),
+                "condition_id": book.get("market"),
+                "event_slug": slug,
+                "best_bid": bids[0]["price"] if bids else None,
+                "best_ask": asks[0]["price"] if asks else None,
+                "bid_size": bids[0]["size"] if bids else None,
+                "ask_size": asks[0]["size"] if asks else None,
+                "bids_top5": bids[:BOOK_DEPTH],
+                "asks_top5": asks[:BOOK_DEPTH],
+                "last_trade": _num(book.get("last_trade_price")),
+                "book_hash": book.get("hash"),
+                "tick_size": _num(book.get("tick_size")),
+            },
+        )
+    return out

@@ -111,7 +111,7 @@ async def test_kalshi_and_reference_fetch_specs():
 
     keys = {}
     for cls in (KalshiRecorder, ReferenceRecorder):
-        specs = await cls(client=None, bus=None).fetch_specs()  # type: ignore[arg-type]
+        specs = await cls(client=None, bus=None).fetch_specs(TICK)  # type: ignore[arg-type]
         keys[cls.venue] = sorted(
             make_key(s.endpoint, s.params)
             for s in specs  # same rule the envelope uses

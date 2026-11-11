@@ -168,7 +168,7 @@ APIs were re-checked live on 2026-11-11 before building.
 |---|---|---|
 | `kalshi` | 4 × `GET /markets?series_ticker=S&status=open&limit=1000` (KXBTCD, KXBTC, KXETHD, KXETH) | 318–390 markets per series, one page. Prices are dollar strings, sizes `_fp` strings. `KXBTCD` has hourly events plus the 5 pm daily. Top of book only. |
 | `reference` | 2 × Binance vision klines (`limit=2`), 2 × Coinbase ticker | The parser keeps only the candle that closed before the tick, never the forming one. |
-| `polymarket` (PR ②) | Gamma `/events?slug=…` for `{bitcoin,ethereum}-{above,price}-on-{date}` over the listed days, refreshed **every 10 min** and cached ⚖️; CLOB `POST /books` every minute | ⚠️ CLOB returns bids ascending and asks descending: best price is the **last** element. The parser sorts. |
+| `polymarket` | **One** Gamma call `/events?slug=…&slug=…` for `{bitcoin,ethereum}-{above,price}-on-{date}` over the next 7 ET dates, refreshed **every 10 min** and cached ⚖️ (retried every tick until it succeeds); one CLOB `POST /books` per event (ladder) every minute, skipped once the ladder's settle time has passed | ⚠️ CLOB returns bids ascending and asks descending: best price is the **last** element. The parser sorts. |
 | `settlements` (PR ③) | Hourly tick ⚖️: Kalshi `status=finalized` markets (gives the real BRTI `expiration_value`), resolved Polymarket events | Refetches the last 48 h each run; the `(venue, contract_id)` dedup key makes that harmless. |
 
 ⚖️ **Polymarket tables split** into a dimension (`polymarket_contracts`) and a fact table (`polymarket_books`), joined on `yes_token_id` in analysis. Alternatives rejected: a stateful writer remembering discovery (breaks order-independent replay of the raw archive), and recorders merging metadata before publish (breaks decision A1).
@@ -176,3 +176,9 @@ APIs were re-checked live on 2026-11-11 before building.
 **Kalshi `exchange_ts` is null** (changed during implementation): `updated_time` is when the market's metadata last changed (often hours old), not a quote time, so using it would give a meaningless clock-skew figure. Kalshi REST gives no quote timestamp.
 
 **Staleness after sleep:** if the machine sleeps *during* a fetch, the response can arrive long after `snapshot_ts`. `recv_ts` stays truthful, so the Stage 1.5 data-quality check flags rows with `recv_ts − snapshot_ts` above a threshold.
+
+**Polymarket details (built 2026-11-11):**
+- Bracket semantics, from the market rules: `above` pays if close > strike_low; `below` if close < strike_high; `range` if strike_low ≤ close < strike_high ("exactly between two brackets → the higher bracket").
+- Fees: `feesEnabled` with `feeType: crypto_fees_v2`, `feeSchedule {rate: 0.07, takerOnly: true, rebateRate: 0.2}`. Stored raw as JSON in `polymarket_contracts.fee_schedule` for the backtest.
+- `/books` silently omits tokens that have resolved (HTTP 200, fewer rows), so settled contracts cause no errors.
+- The recorder reads only token ids and end times from Gamma (to know what to fetch); all row parsing is in the writer. `fetch_specs` now receives `snapshot_ts`, and `FetchSpec` supports POST bodies and repeated query parameters.
