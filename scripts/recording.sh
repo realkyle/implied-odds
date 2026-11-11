@@ -5,14 +5,16 @@
 #   scripts/recording.sh stop     stop them cleanly (SIGTERM: each finishes its current step)
 #   scripts/recording.sh status   show what is running, Redis queue state and recent logs
 #
-# Processes run under `caffeinate -i` so the Mac doesn't idle-sleep while recording.
-# Closing the lid still sleeps the machine; ticks missed then are skipped and logged.
+# Processes run under `caffeinate -s`, which blocks system sleep while on AC power. On
+# battery, or with the lid closed on battery, macOS sleeps anyway (2026-11-11: only 91 of
+# ~723 overnight minutes recorded). Keep the laptop plugged in with the lid open. Ticks
+# missed while asleep are skipped and logged, never stored under the wrong time.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RUN_DIR=run
 LOG_DIR=logs
-SERVICES=(writer deribit)   # add venues here as their recorders land
+SERVICES=(writer deribit kalshi reference)   # add venues here as their recorders land
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 cmd_for() {
@@ -29,7 +31,7 @@ start() {
   for svc in "${SERVICES[@]}"; do
     if is_running "$svc"; then echo "$svc already running (pid $(cat "$RUN_DIR/$svc.pid"))"; continue; fi
     # nohup + background: keeps running after this terminal (or Claude session) closes.
-    nohup caffeinate -i $(cmd_for "$svc") >> "$LOG_DIR/$svc.log" 2>&1 &
+    nohup caffeinate -s $(cmd_for "$svc") >> "$LOG_DIR/$svc.log" 2>&1 &
     echo $! > "$RUN_DIR/$svc.pid"
     echo "started $svc (pid $!)"
   done

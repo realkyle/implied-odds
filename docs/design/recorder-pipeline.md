@@ -1,6 +1,6 @@
 # Recorder pipeline: design (Phase 0, Stage 1)
 
-Status: **designed and agreed** (decisions marked ⚖️ were made 2026-11-10). Last updated 2026-11-10.
+Status: **designed and agreed** (decisions marked ⚖️ were made 2026-11-10). Last updated 2026-11-11.
 
 ## 1. Problem and "done"
 
@@ -102,9 +102,10 @@ Clock skew per venue = `recv_ts − exchange_ts` (an upper bound that includes n
 |---|---|---|
 | `deribit_options` | **snapshot_ts, instrument**, expiry_ts, strike, option_type, bid, ask, mark, mark_iv, underlying_price, underlying_index, index_price, open_interest, volume, interest_rate | Prices in **coin** (inverse); USD conversion happens in analysis, not here |
 | `deribit_futures` | **snapshot_ts, instrument**, expiry_ts (null for perp), bid, ask, mark, last, funding_8h, open_interest, index_price | |
-| `kalshi_markets` | **snapshot_ts, ticker**, series, event_ticker, strike_type, floor_strike, cap_strike, settle_ts, yes_bid, yes_ask, yes_bid_size, yes_ask_size, last_price, volume, open_interest, status | `settle_ts` = `close_time`; prices in dollars |
-| `polymarket_markets` | **snapshot_ts, yes_token_id**, event_slug, condition_id, contract_type (`above`/`range`), strike_low, strike_high, settle_ts, best_bid, best_ask, bid_size, ask_size, bids_top5, asks_top5, last_trade, book_hash, fees_enabled | Touch markets ("what price will BTC hit") are excluded: they pay on a touch, not at expiry |
-| `reference_prices` | **snapshot_ts, source, symbol**, price, bid, ask | `binance_vision` (Polymarket settlement source), `coinbase` (BRTI proxy) |
+| `kalshi_markets` | **snapshot_ts, ticker**, series, event_ticker, strike_type, floor_strike, cap_strike, settle_ts, yes_bid, yes_ask, yes_bid_size, yes_ask_size, last_price, volume, open_interest, status | `settle_ts` = `close_time` (not `expiration_time`, which is a week later); prices in dollars; `exchange_ts` is null (see §10) |
+| `polymarket_contracts` ⚖️ | **yes_token_id**, event_slug, condition_id, asset, contract_type (`above`/`below`/`range`), strike_low, strike_high, settle_ts, fees_enabled, fee fields, first_seen_ts | Dimension table: static per contract. Touch markets ("what price will BTC hit") are excluded: they pay on a touch, not at expiry |
+| `polymarket_books` ⚖️ | **snapshot_ts, yes_token_id**, best_bid, best_ask, bid_size, ask_size, bids_top5, asks_top5, last_trade, book_hash | Fact table, one row per contract per minute; join to `polymarket_contracts` on `yes_token_id` |
+| `reference_prices` | **snapshot_ts, source, symbol**, price, bid, ask | `binance_vision`: close of the 1m candle that closed just before the tick, so the row at noon ET is Polymarket's settlement candle; `coinbase`: last trade + bid/ask (BRTI proxy) |
 | `settlements` | **venue, contract_id**, settle_ts, result, settlement_value, collected_ts | From a daily collector; Kalshi gives the actual BRTI average |
 
 ## 5. Backpressure
@@ -158,3 +159,20 @@ Parsers are **pure functions** (JSON in, rows out) tested against saved real res
 ## 9. New dependencies
 
 `httpx` (async HTTP), `pyarrow` (Parquet + schemas), `redis` (official client, asyncio support). Dev: `fakeredis` (in-memory Redis for unit tests, so tests don't need Docker).
+
+## 10. Venue recorders (decided 2026-11-11)
+
+APIs were re-checked live on 2026-11-11 before building.
+
+| Recorder | Calls per tick | Notes |
+|---|---|---|
+| `kalshi` | 4 × `GET /markets?series_ticker=S&status=open&limit=1000` (KXBTCD, KXBTC, KXETHD, KXETH) | 318–390 markets per series, one page. Prices are dollar strings, sizes `_fp` strings. `KXBTCD` has hourly events plus the 5 pm daily. Top of book only. |
+| `reference` | 2 × Binance vision klines (`limit=2`), 2 × Coinbase ticker | The parser keeps only the candle that closed before the tick, never the forming one. |
+| `polymarket` (PR ②) | Gamma `/events?slug=…` for `{bitcoin,ethereum}-{above,price}-on-{date}` over the listed days, refreshed **every 10 min** and cached ⚖️; CLOB `POST /books` every minute | ⚠️ CLOB returns bids ascending and asks descending: best price is the **last** element. The parser sorts. |
+| `settlements` (PR ③) | Hourly tick ⚖️: Kalshi `status=finalized` markets (gives the real BRTI `expiration_value`), resolved Polymarket events | Refetches the last 48 h each run; the `(venue, contract_id)` dedup key makes that harmless. |
+
+⚖️ **Polymarket tables split** into a dimension (`polymarket_contracts`) and a fact table (`polymarket_books`), joined on `yes_token_id` in analysis. Alternatives rejected: a stateful writer remembering discovery (breaks order-independent replay of the raw archive), and recorders merging metadata before publish (breaks decision A1).
+
+**Kalshi `exchange_ts` is null** (changed during implementation): `updated_time` is when the market's metadata last changed (often hours old), not a quote time, so using it would give a meaningless clock-skew figure. Kalshi REST gives no quote timestamp.
+
+**Staleness after sleep:** if the machine sleeps *during* a fetch, the response can arrive long after `snapshot_ts`. `recv_ts` stays truthful, so the Stage 1.5 data-quality check flags rows with `recv_ts − snapshot_ts` above a threshold.

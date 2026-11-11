@@ -62,6 +62,27 @@ SCHEMAS: dict[str, pa.Schema] = {
             _f("index_price", pa.float64()),
         ]
     ),
+    "kalshi_markets": pa.schema(
+        [
+            *COMMON,  # exchange_ts is null: the REST response has no quote timestamp
+            _f("ticker", pa.string(), required=True),  # e.g. KXBTCD-26NOV1117-T83749.99
+            _f("series", pa.string(), required=True),
+            _f("event_ticker", pa.string(), required=True),
+            _f("strike_type", pa.string(), required=True),  # greater / less / between
+            _f("floor_strike", pa.float64()),  # set for greater and between
+            _f("cap_strike", pa.float64()),  # set for less and between
+            _f("settle_ts", TS, required=True),  # close_time: end of the 60 s averaging window
+            # Prices are in dollars per $1 contract (0.42 = 42 cents = 42% implied).
+            _f("yes_bid", pa.float64()),
+            _f("yes_ask", pa.float64()),
+            _f("yes_bid_size", pa.float64()),  # contracts
+            _f("yes_ask_size", pa.float64()),
+            _f("last_price", pa.float64()),
+            _f("volume", pa.float64()),
+            _f("open_interest", pa.float64()),
+            _f("status", pa.string()),
+        ]
+    ),
     "reference_prices": pa.schema(
         [
             *COMMON,
