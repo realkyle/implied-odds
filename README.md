@@ -27,6 +27,8 @@ At-least-once delivery plus idempotent writes means a crash of any component los
 docker compose up -d redis
 uv run ppm writer            # one terminal
 uv run ppm record deribit    # another terminal
+
+scripts/recording.sh start   # or: run everything detached (status / stop)
 ```
 
 ## Build and test

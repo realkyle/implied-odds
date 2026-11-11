@@ -30,6 +30,9 @@ def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)sZ %(levelname)s %(name)s: %(message)s"
     )
+    # httpx logs every request at INFO (thousands of lines a day); failures are
+    # already logged by the recorder with their cause.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _stop_event() -> asyncio.Event:
