@@ -139,6 +139,22 @@ SCHEMAS: dict[str, pa.Schema] = {
             _f("ask", pa.float64()),
         ]
     ),
+    # What each contract settled on. Collected hourly over a 48 h window, so the same
+    # contract appears many times in staging; the daily merge keeps one row per
+    # (venue, contract_id).
+    "settlements": pa.schema(
+        [
+            *COMMON,  # snapshot_ts = collection run; exchange_ts = when the venue settled
+            _f("venue", pa.string(), required=True),  # kalshi / polymarket / binance
+            _f("contract_id", pa.string(), required=True),  # ticker / yes_token_id / SYMBOL@date
+            _f("event_id", pa.string()),  # event_ticker / event slug / symbol
+            _f("settle_ts", TS, required=True),  # the moment the outcome refers to
+            _f("result", pa.string()),  # yes / no; null for binance price rows
+            # kalshi: the 60 s BRTI average; binance: the candle close; polymarket: null
+            # (join the binance row for the same asset and settle_ts)
+            _f("settlement_value", pa.float64()),
+        ]
+    ),
     # One row per fetch, success or failure: the gap log and latency/skew record.
     "fetch_log": pa.schema(
         [

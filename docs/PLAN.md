@@ -166,7 +166,7 @@ About 10 weeks part-time. Phase 0 starts immediately because the dataset grows w
 - [x] Kalshi recorder: open KXBTCD / KXBTC / KXETHD / KXETH markets, top-of-book and last trade (depth needs the authenticated websocket)
 - [x] Polymarket recorder: BTC/ETH "above" and "price on" ladders, CLOB top of book and depth (top 5 levels)
 - [x] Reference prices: Binance BTC/USDT 1m candle (Polymarket's settlement source), Coinbase BTC-USD (BRTI proxy)
-- [ ] Settlement collector: Kalshi results and settlement values, Polymarket outcomes, Binance close at each settle time
+- [x] Settlement collector: Kalshi results and settlement values, Polymarket outcomes, Binance close at each settle time
 - [ ] Common schema, one Parquet file per venue per day, UTC timestamps
 - [ ] Runs unattended (cron, systemd or a small cloud VM) with logging and restart
 

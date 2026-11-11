@@ -169,7 +169,7 @@ APIs were re-checked live on 2026-11-11 before building.
 | `kalshi` | 4 × `GET /markets?series_ticker=S&status=open&limit=1000` (KXBTCD, KXBTC, KXETHD, KXETH) | 318–390 markets per series, one page. Prices are dollar strings, sizes `_fp` strings. `KXBTCD` has hourly events plus the 5 pm daily. Top of book only. |
 | `reference` | 2 × Binance vision klines (`limit=2`), 2 × Coinbase ticker | The parser keeps only the candle that closed before the tick, never the forming one. |
 | `polymarket` | **One** Gamma call `/events?slug=…&slug=…` for `{bitcoin,ethereum}-{above,price}-on-{date}` over the next 7 ET dates, refreshed **every 10 min** and cached ⚖️ (retried every tick until it succeeds); one CLOB `POST /books` per event (ladder) every minute, skipped once the ladder's settle time has passed | ⚠️ CLOB returns bids ascending and asks descending: best price is the **last** element. The parser sorts. |
-| `settlements` (PR ③) | Hourly tick ⚖️: Kalshi `status=finalized` markets (gives the real BRTI `expiration_value`), resolved Polymarket events | Refetches the last 48 h each run; the `(venue, contract_id)` dedup key makes that harmless. |
+| `settlements` | Hourly tick ⚖️, plus once at start-up: Kalshi `status=settled` markets closed in the last 48 h (`result` + `expiration_value`, the real BRTI average), paged with `cursor`, one series at a time with 0.25 s between pages; one Gamma call for resolved Polymarket events over the last 3 ET dates; Binance 1m candle closing at noon ET for each of those dates | 48 h refetch kept after re-weighing it against a 6 h window (2026-11-11): simplest, and it survives laptop sleeps without a restart. The `(venue, contract_id)` dedup key makes the overlap harmless. ~46k rows, 53 requests, ~22 s, ~1.6 MB gzipped raw per run. |
 
 ⚖️ **Polymarket tables split** into a dimension (`polymarket_contracts`) and a fact table (`polymarket_books`), joined on `yes_token_id` in analysis. Alternatives rejected: a stateful writer remembering discovery (breaks order-independent replay of the raw archive), and recorders merging metadata before publish (breaks decision A1).
 
@@ -182,3 +182,9 @@ APIs were re-checked live on 2026-11-11 before building.
 - Fees: `feesEnabled` with `feeType: crypto_fees_v2`, `feeSchedule {rate: 0.07, takerOnly: true, rebateRate: 0.2}`. Stored raw as JSON in `polymarket_contracts.fee_schedule` for the backtest.
 - `/books` silently omits tokens that have resolved (HTTP 200, fewer rows), so settled contracts cause no errors.
 - The recorder reads only token ids and end times from Gamma (to know what to fetch); all row parsing is in the writer. `fetch_specs` now receives `snapshot_ts`, and `FetchSpec` supports POST bodies and repeated query parameters.
+
+**Settlement details (built 2026-11-11):**
+- The `settlements` table: COMMON columns + `venue` (kalshi / polymarket / binance), `contract_id` (ticker / yes_token_id / `SYMBOL@date`), `event_id`, `settle_ts`, `result` (yes/no), `settlement_value` (BRTI average for Kalshi, candle close for Binance). `exchange_ts` = when the venue settled.
+- Kalshi's `status=settled` filter returns markets whose status is `finalized`. Markets closed but not yet settled are skipped and picked up by a later run.
+- Binance returns the next existing candle if the requested minute has none, so the parser checks the candle's open time and quarantines a mismatch.
+- The recorder base gained `tick_ms` (hourly here) and `run_on_start`. Settlements also allow a wake-up up to an hour late, since their rows carry their own timestamps and can't be mislabelled.

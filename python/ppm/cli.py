@@ -22,11 +22,19 @@ from ppm.recorders.deribit import DeribitRecorder
 from ppm.recorders.kalshi import KalshiRecorder
 from ppm.recorders.polymarket import PolymarketRecorder
 from ppm.recorders.reference import ReferenceRecorder
+from ppm.recorders.settlements import SettlementRecorder
 from ppm.writer.storage import DataStore
 from ppm.writer.writer import Writer
 
 RECORDERS: dict[str, type[Recorder]] = {
-    r.venue: r for r in (DeribitRecorder, KalshiRecorder, PolymarketRecorder, ReferenceRecorder)
+    r.venue: r
+    for r in (
+        DeribitRecorder,
+        KalshiRecorder,
+        PolymarketRecorder,
+        ReferenceRecorder,
+        SettlementRecorder,
+    )
 }
 
 
