@@ -44,6 +44,9 @@ stop() {
       # caffeinate passes SIGTERM on to nothing, so signal its child (the python process).
       pkill -TERM -P "$pid" 2>/dev/null || true
       kill -TERM "$pid" 2>/dev/null || true
+      # Wait for a clean exit (the writer may be mid blocking read, up to ~5 s), so a
+      # restart never runs two copies at once.
+      for _ in $(seq 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
       echo "stopped $svc"
     fi
     rm -f "$RUN_DIR/$svc.pid"
