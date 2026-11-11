@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 import httpx
 
 from ppm.pipeline.bus import PublishResult, RedisBus
-from ppm.pipeline.clock import Clock, next_tick, now_ms, sleep_until
+from ppm.pipeline.clock import TICK_MS, Clock, floor_tick, next_tick, now_ms, sleep_until
 from ppm.pipeline.envelope import STATUS_ERROR, Envelope
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,10 @@ class FetchSpec:
 
 class Recorder(ABC):
     venue: ClassVar[str]
+    tick_ms: ClassVar[int] = TICK_MS  # how often to record; ticks align to the wall clock
+    # Collect at start-up for the current tick instead of waiting for the next one. Only
+    # for recorders whose data carries its own timestamps (settlements), never snapshots.
+    run_on_start: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -66,8 +70,10 @@ class Recorder(ABC):
 
     async def run_forever(self, stop: asyncio.Event) -> None:
         log.info("%s recorder started", self.venue)
+        if self.run_on_start:
+            await self._run_logged(floor_tick(self._clock(), self.tick_ms))
         while not stop.is_set():
-            tick = next_tick(self._clock())
+            tick = next_tick(self._clock(), self.tick_ms)
             if not await sleep_until(tick, stop, self._clock):
                 break
             lateness = self._clock() - tick
@@ -78,12 +84,15 @@ class Recorder(ABC):
                     "%s missed tick %d: woke %.1f s late", self.venue, tick, lateness / 1000
                 )
                 continue
-            try:
-                results = await self.run_tick(tick)
-                log.info("%s tick %d: %s", self.venue, tick, _summarise(results))
-            except Exception:  # never let one bad tick kill the recorder
-                log.exception("%s tick %d failed", self.venue, tick)
+            await self._run_logged(tick)
         log.info("%s recorder stopped", self.venue)
+
+    async def _run_logged(self, tick: int) -> None:
+        try:
+            results = await self.run_tick(tick)
+            log.info("%s tick %d: %s", self.venue, tick, _summarise(results))
+        except Exception:  # never let one bad tick kill the recorder
+            log.exception("%s tick %d failed", self.venue, tick)
 
     async def run_tick(self, snapshot_ts: int) -> list[PublishResult]:
         specs = await self.fetch_specs(snapshot_ts)

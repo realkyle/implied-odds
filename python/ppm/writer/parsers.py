@@ -12,7 +12,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from ppm.pipeline.envelope import Envelope
@@ -413,4 +413,107 @@ def parse_polymarket_books(env: Envelope) -> ParseResult:
                 "tick_size": _num(book.get("tick_size")),
             },
         )
+    return out
+
+
+# --- Settlements -----------------------------------------------------------------
+
+_SETTLED = {"settled", "finalized"}
+
+
+def _settlement_row(env: Envelope, **fields: Any) -> Row:
+    return {"snapshot_ts": env.snapshot_ts, "recv_ts": env.recv_ts, **fields}
+
+
+@parser("settlements", "kalshi_settled")
+def parse_kalshi_settled(env: Envelope) -> ParseResult:
+    series = env.params["series"]
+    asset = KALSHI_SERIES_ASSET.get(series)
+    out = ParseResult()
+    for m in json.loads(env.body)["markets"]:
+        if m.get("status") not in _SETTLED or m.get("result") not in ("yes", "no"):
+            continue  # closed but not settled yet: the next hourly run picks it up
+        if asset is None:
+            out.reject("settlements", m, f"unknown series {series!r}")
+            continue
+        out.add(
+            "settlements",
+            _settlement_row(
+                env,
+                exchange_ts=_iso_ms(m.get("settlement_ts")),
+                asset=asset,
+                venue="kalshi",
+                contract_id=m.get("ticker"),
+                event_id=m.get("event_ticker"),
+                settle_ts=_iso_ms(m.get("close_time")),
+                result=m["result"],
+                settlement_value=_num(m.get("expiration_value")),
+            ),
+        )
+    return out
+
+
+@parser("settlements", "polymarket_resolved")
+def parse_polymarket_resolved(env: Envelope) -> ParseResult:
+    out = ParseResult()
+    for event in json.loads(env.body):
+        slug = event["slug"]
+        asset = _pm_asset(slug)
+        for m in event.get("markets", []):
+            if not m.get("closed"):
+                continue
+            outcomes = json.loads(m["outcomes"])
+            prices = json.loads(m.get("outcomePrices") or "[]")
+            final = dict(zip(outcomes, prices, strict=False))
+            if sorted(final.values()) != ["0", "1"]:
+                continue  # closed but not resolved yet (or disputed)
+            if asset is None:
+                out.reject("settlements", m, f"unknown asset in slug {slug!r}")
+                continue
+            tokens = json.loads(m["clobTokenIds"])
+            out.add(
+                "settlements",
+                _settlement_row(
+                    env,
+                    exchange_ts=None,
+                    asset=asset,
+                    venue="polymarket",
+                    contract_id=tokens[outcomes.index("Yes")],
+                    event_id=slug,
+                    settle_ts=_iso_ms(m.get("endDate")),
+                    result="yes" if final["Yes"] == "1" else "no",
+                    settlement_value=None,
+                ),
+            )
+    return out
+
+
+@parser("settlements", "binance_settle_candle")
+def parse_binance_settle_candle(env: Envelope) -> ParseResult:
+    """The 1m candle closing at noon ET. Binance returns the next candle that exists if
+    the requested minute has none, so check it really is the minute we asked for."""
+    from ppm.recorders.settlements import noon_et_ms  # local import: avoid a cycle
+
+    symbol = env.params["symbol"]
+    settle = noon_et_ms(date.fromisoformat(env.params["date"]))
+    out = ParseResult()
+    candles = json.loads(env.body)
+    if not candles or int(candles[0][_K_OPEN_TIME]) != settle - 60_000:
+        out.reject("settlements", {"candles": candles}, f"no candle opening at {settle - 60_000}")
+        return out
+    k = candles[0]
+    out.add(
+        "settlements",
+        _settlement_row(
+            env,
+            exchange_ts=int(k[_K_CLOSE_TIME]),
+            asset=symbol.removesuffix("USDT"),
+            venue="binance",
+            contract_id=f"{symbol}@{env.params['date']}",
+            event_id=symbol,
+            settle_ts=settle,
+            result=None,
+            settlement_value=_num(k[_K_CLOSE]),
+        ),
+    )
     return out
