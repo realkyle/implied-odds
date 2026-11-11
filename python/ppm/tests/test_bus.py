@@ -84,3 +84,17 @@ async def test_unacked_messages_are_redelivered_after_a_crash(redis, tmp_path, m
 
     await restarted.ack(again[0])
     assert await restarted.read(block_ms=None) == []
+
+
+async def test_queue_drained_waits_for_unread_and_unacked_messages(redis, make):
+    from ppm.pipeline.bus import queue_drained
+
+    consumer = StreamConsumer(redis, venues=["deribit"])
+    await consumer.ensure_groups()
+    assert await queue_drained(redis, ["deribit", "kalshi"])  # kalshi stream doesn't exist
+    await redis.xadd(stream_name("deribit"), make().to_fields())
+    assert not await queue_drained(redis, ["deribit"])  # lag: not yet delivered
+    (delivery,) = await consumer.read(block_ms=None)
+    assert not await queue_drained(redis, ["deribit"])  # pending: delivered, not acked
+    await consumer.ack(delivery)
+    assert await queue_drained(redis, ["deribit"])

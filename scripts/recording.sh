@@ -16,12 +16,13 @@ cd "$(dirname "$0")/.."
 
 RUN_DIR=run
 LOG_DIR=logs
-SERVICES=(writer deribit kalshi polymarket reference settlements)   # add venues here as their recorders land
+SERVICES=(writer deribit kalshi polymarket reference settlements merger)   # add venues here as their recorders land
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 cmd_for() {
   case "$1" in
     writer) echo "uv run ppm writer" ;;
+    merger) echo "uv run ppm merge --loop" ;;
     *)      echo "uv run ppm record $1" ;;
   esac
 }

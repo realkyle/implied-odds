@@ -43,9 +43,10 @@ surface, and tests whether the gaps survive fees, hedging costs and the venues' 
 | Polymarket: BTC/ETH "above" and range ladders, 5-level order books | ✅ Recording |
 | Reference prices: Binance 1m candles (Polymarket's settlement), Coinbase (BRTI proxy) | ✅ Recording |
 | Settlement collector: Kalshi results + actual BRTI values, Polymarket resolutions, Binance settlement candles | ✅ Running hourly |
-| Daily merge + hash-chained manifest, failure/kill tests | 🔨 Next |
 | Docker image + Compose for every service, with restart policies; kill-tested | ✅ Built |
+| Daily merge: dedup, one file per table per day, raw archive; SHA-256 hash-chained manifest + `ppm verify` with tampering tests | ✅ Built |
 | Cloud VM (Terraform, AWS Lightsail) + nightly S3 backup | 🔨 Next |
+| Remaining failure tests (recorder kills, Redis outage, network cut) | 🔨 Next |
 | Prometheus/Grafana, health checks, alerts | 📋 Planned |
 | C++ pricing core: Black-76, IV solver, SVI/SSVI fit, arbitrage checks, skew-corrected digitals | 📋 Planned |
 | Contract matching, divergence analysis, calibration, backtest with costs | 📋 Planned |
@@ -76,6 +77,7 @@ flowchart LR
 | Writer crashes mid-batch | Messages it took but didn't finish stay pending in Redis | Ack only after files are durable. On restart, pending messages are re-read before new ones |
 | Same message delivered twice | It would duplicate rows | File names derive from (tick, venue, request), so a replay overwrites the identical file |
 | Crash while writing a file | It would leave a half-written file | Write to a temp file, `fsync`, then atomic rename |
+| Someone edits or deletes past data | It would silently bias results | Daily files are recorded in a SHA-256 hash chain; `ppm verify` recomputes it and fails loudly |
 | Redis unreachable | Recorders can't publish | Each recorder spools to disk (bounded) and replays in order. A drop happens only if the spool is full, and is logged as `DATA LOSS` |
 | Venue changes a field's type | It would silently corrupt the data | Explicit Arrow schemas. Bad rows go to quarantine, never into the tables |
 | Machine sleeps through a tick | Current prices would be stored under an old timestamp | A tick woken more than 5 s late is skipped and logged, never stored under the wrong time |
@@ -93,6 +95,7 @@ Design notes with the decisions and the options rejected: [`docs/design/recorder
 - **Star schema for Polymarket.** Contract terms (strike, settle time, fees) and minute-by-minute books are
   separate tables. Joining them in the writer would make output depend on message order.
 - **Async fetching.** All of a venue's endpoints are requested together, so each snapshot is internally aligned.
+- **Append-only, hash-chained history.** Each daily file's entry includes the previous entry's hash, so any edit breaks every later link. Corrections are new entries that name what they supersede, so history is never rewritten.
 
 ## Measured so far
 
@@ -105,6 +108,8 @@ All numbers below were measured on a laptop and are recorded in the project log.
 | Alignment within a Deribit snapshot | All 6 responses within 11–65 ms of each other |
 | Writer crash recovery | 18 queued snapshots drained in < 8 s, 0 lost, 0 duplicated |
 | Writer SIGKILL under Docker Compose | Restarted in 0.9 s; 146/146 messages written exactly once |
+| Daily merge (16 h of real data) | 21,949 files → 13; 222 MB → 109 MB; 6.3 s; peak memory 396 MB |
+| `ppm verify` (hash chain + every file) | 0.28 s; catches modified, deleted, swapped, inserted and forged files |
 | Rows quarantined in live runs | 0 |
 | Polymarket range-ladder sanity check | Mid prices sum to 1.024 (≈ 1 plus the bid-ask spread) |
 | Settlement cross-check | All 22 resolved Polymarket BTC contracts on 2026-11-10 agree with the Binance noon close and our bracket rules |

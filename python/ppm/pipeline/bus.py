@@ -203,3 +203,23 @@ class StreamConsumer:
 
 def _text(value: bytes | str) -> str:
     return value.decode() if isinstance(value, bytes) else value
+
+
+async def queue_drained(redis: Redis, venues: list[str], group: str = WRITER_GROUP) -> bool:
+    """True when the writer has read and acknowledged everything on every stream.
+
+    `pending` counts messages delivered but not yet acked; `lag` counts messages not yet
+    delivered. The daily merge waits for both to be zero, so a day isn't finalized while
+    some of its data is still in the queue.
+    """
+    for venue in venues:
+        try:
+            groups = await redis.xinfo_groups(stream_name(venue))
+        except redis_errors.ResponseError:  # stream doesn't exist yet: nothing queued
+            continue
+        for g in groups:
+            if _text(g["name"]) != group:
+                continue
+            if g.get("pending", 0) or g.get("lag", 0):
+                return False
+    return True

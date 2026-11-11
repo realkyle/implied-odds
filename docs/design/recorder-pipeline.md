@@ -119,10 +119,23 @@ Clock skew per venue = `recv_ts − exchange_ts` (an upper bound that includes n
 
 ## 6. Hash chain
 
-After the daily merge, `data/manifest.jsonl` gets one line per (date, table):
-`{date, table, rows, file_sha256, prev_chain, chain = sha256(file_sha256 + prev_chain)}`.
-`ppm verify` recomputes the chain and **fails loudly** on a mismatch. Analysis calls it first.
-Test: modify, delete or reorder a file and confirm verification fails.
+*Built 2026-11-11; decisions ⚖️ by the owner.*
+
+**Daily merge** (`ppm merge --loop`, hourly at :07; a day is merged from D+1 02:00 UTC once the writer has nothing pending or unread):
+- `staging/{table}/date=D/*.parquet` → `tables/{table}/date=D/part-N.parquet`, deduplicated on the table's key and sorted. Tables keyed by tick are merged one hour at a time (bounded memory). Keep rule: the first received copy, or the latest collection for `settlements` and `polymarket_contracts`.
+- ⚖️ `raw/{venue}/date=D/*.env` → `archive/{venue}/date=D/raw-N.tar`: an uncompressed tar of the already-gzipped responses, with fixed metadata so the bytes are reproducible. Raw is hash-chained too.
+- ⚖️ Inputs are deleted only after the output is re-read and checked, and its manifest entry is written.
+- Crash-safe re-runs: an unregistered output is overwritten; leftover staging re-merges to identical bytes (hash compare) and adds no entry; raw already in an archive isn't archived twice.
+
+**Manifest** `data/manifest.jsonl`, one line per output file:
+`{seq, date, kind, name, path, count, bytes, sha256, created_ts, supersedes, reason, prev, chain}` with
+`chain = sha256(prev + canonical JSON of every other field)`. The chain covers the metadata too, so forging a file *and* its recorded hash still breaks the chain.
+
+⚖️ **Append-only amendments:** late data for a merged day writes `part-(N+1)` with `supersedes` and a `reason`. Old parts are kept and still verified. Analysis reads the latest part per (table, day).
+
+**`ppm verify`:** recomputes every hash and the chain; also flags files under `tables/` or `archive/` that aren't in the manifest. It prints the head (the last chain value). Truncating the manifest's tail is only detectable against a recorded head (`--expect-head`), so heads should be recorded off-machine (planned: alongside the S3 backup).
+
+Tests: modify one byte, delete, swap, insert an extra file, edit an entry, forge a file plus its hash, reorder, delete a middle entry, truncate the tail (caught only with the recorded head).
 
 ## 7. Failure tests (each one gives a measured number for the WorkLog)
 

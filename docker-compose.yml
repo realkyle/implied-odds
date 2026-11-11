@@ -70,5 +70,10 @@ services:
     <<: *ppm
     command: ["record", "settlements"]
 
+  # Merges each finished UTC day into hash-chained daily files (hourly check at :07).
+  merger:
+    <<: *ppm
+    command: ["merge", "--loop"]
+
 volumes:
   redis-data:
