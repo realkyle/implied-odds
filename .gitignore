@@ -32,3 +32,6 @@ docs/CodeGuide.md
 .DS_Store
 .vscode/
 .idea/
+
+# Recorder spool (envelopes buffered while Redis is unreachable)
+spool/

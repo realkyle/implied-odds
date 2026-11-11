@@ -162,13 +162,39 @@ About 10 weeks part-time. Phase 0 starts immediately because the dataset grows w
 ### Phase 0 — Recorder (week 1)
 
 - [x] Repo skeleton, `pyproject.toml`, linting, CI stub
-- [ ] Deribit recorder: full BTC option chain + index + perpetual, every 60 s
-- [ ] Kalshi recorder: open KXBTCD / KXBTC markets, top-of-book and last trade
-- [ ] Polymarket recorder: "Bitcoin above" events, CLOB mid and spread
+- [ ] Deribit recorder: full BTC + ETH option chains + index + futures/perpetual, every 60 s
+- [ ] Kalshi recorder: open KXBTCD / KXBTC / KXETHD / KXETH markets, top-of-book and last trade
+- [ ] Polymarket recorder: BTC/ETH "above" and "price on" ladders, CLOB top of book and depth
+- [ ] Reference prices: Binance BTC/USDT 1m candle (Polymarket's settlement source), Coinbase BTC-USD (BRTI proxy)
+- [ ] Settlement collector: Kalshi results and settlement values, Polymarket outcomes, Binance close at each settle time
 - [ ] Common schema, one Parquet file per venue per day, UTC timestamps
 - [ ] Runs unattended (cron, systemd or a small cloud VM) with logging and restart
 
 Done when: 48 hours of clean, aligned snapshots on disk.
+
+**Systems work (agreed 2026-11-10; design in `docs/design/recorder-pipeline.md`).** Each item is proven by a failure test and one measured number in the WorkLog.
+
+*Stage 1: pipeline (REST polling)*
+- [ ] One process per venue, so one venue failing never stops the others
+- [ ] Recorders publish to Redis Streams; a separate writer consumes into Parquet
+- [ ] Idempotent writes: a replayed message never creates a duplicate row
+- [ ] Exchange timestamp and local receive timestamp on every row; per-venue clock skew and latency logged
+- [ ] Schema validation on write; bad rows go to a quarantine file
+- [ ] Backpressure: bounded buffers when Redis or the writer falls behind, a writer-lag alert, and a slow-writer test
+- [ ] Daily hash chain: manifest of SHA-256(file + previous hash), verified before analysis; tampering test
+- [ ] Failure test: kill each recorder and the writer mid-run and cut the network; zero lost or duplicated rows; recovery time recorded
+
+*Stage 1.5: operations*
+- [ ] Dockerfile per service + docker-compose (recorders, Redis, writer, monitoring), restart policies, health checks
+- [ ] Prometheus metrics (messages/s, last-message age, gaps, writer lag, reconnects) + Grafana dashboard
+- [ ] Alert when a venue has been silent longer than a threshold
+- [ ] Data-quality checks: stale quotes, crossed books, out-of-order timestamps, outliers; share caught per venue and day
+
+*Stage 2: streaming and cloud*
+- [ ] Websockets for Deribit and Polymarket: reconnect with exponential backoff + jitter, resubscribe, sequence-gap detection, REST backfill
+- [ ] Kalshi websocket + live CF Benchmarks index (only if an API key is created)
+- [ ] Terraform for one small cloud VM; move recording off the laptop; record monthly cost
+- [ ] Measure uptime and gap rate over the first multi-week run
 
 ### Phase 1 — C++ foundations (weeks 1–3)
 
