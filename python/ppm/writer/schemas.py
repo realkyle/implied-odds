@@ -25,6 +25,9 @@ COMMON = [
     _f("asset", pa.string(), required=True),  # BTC / ETH
 ]
 
+# One order-book level.
+LEVEL = pa.struct([("price", pa.float64()), ("size", pa.float64())])
+
 SCHEMAS: dict[str, pa.Schema] = {
     "deribit_options": pa.schema(
         [
@@ -81,6 +84,49 @@ SCHEMAS: dict[str, pa.Schema] = {
             _f("volume", pa.float64()),
             _f("open_interest", pa.float64()),
             _f("status", pa.string()),
+        ]
+    ),
+    # Dimension table: one row per contract per discovery (merge keeps the latest by
+    # yes_token_id). Join to polymarket_books on yes_token_id.
+    "polymarket_contracts": pa.schema(
+        [
+            *COMMON,  # snapshot_ts = discovery tick; exchange_ts null
+            _f("yes_token_id", pa.string(), required=True),
+            _f("no_token_id", pa.string()),
+            _f("condition_id", pa.string(), required=True),
+            _f("event_slug", pa.string(), required=True),
+            _f("question", pa.string()),
+            # above: pays if price > strike_low; below: price < strike_high;
+            # range: strike_low <= price < strike_high (a tie goes to the higher bracket).
+            _f("contract_type", pa.string(), required=True),
+            _f("strike_low", pa.float64()),
+            _f("strike_high", pa.float64()),
+            _f("settle_ts", TS, required=True),  # noon ET: Binance 1m candle closing then
+            _f("closed", pa.bool_()),
+            _f("fees_enabled", pa.bool_()),
+            _f("fee_type", pa.string()),  # e.g. crypto_fees_v2
+            _f("fee_schedule", pa.string()),  # raw JSON, e.g. {"rate":0.07,"takerOnly":true}
+            _f("tick_size", pa.float64()),
+            _f("min_order_size", pa.float64()),
+            _f("neg_risk", pa.bool_()),
+        ]
+    ),
+    # Fact table: one row per contract per minute.
+    "polymarket_books": pa.schema(
+        [
+            *COMMON,  # exchange_ts = book timestamp from the CLOB
+            _f("yes_token_id", pa.string(), required=True),
+            _f("condition_id", pa.string()),
+            _f("event_slug", pa.string(), required=True),
+            _f("best_bid", pa.float64()),  # null when that side of the book is empty
+            _f("best_ask", pa.float64()),
+            _f("bid_size", pa.float64()),  # shares at the best price
+            _f("ask_size", pa.float64()),
+            _f("bids_top5", pa.list_(LEVEL)),  # best first
+            _f("asks_top5", pa.list_(LEVEL)),
+            _f("last_trade", pa.float64()),
+            _f("book_hash", pa.string()),
+            _f("tick_size", pa.float64()),
         ]
     ),
     "reference_prices": pa.schema(

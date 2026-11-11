@@ -13,7 +13,7 @@ import random
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import httpx
 
@@ -26,13 +26,16 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class FetchSpec:
-    """One HTTP GET to make each tick. `params` names the fetch (it becomes part of the
-    envelope key); `query` is what is actually sent to the venue."""
+    """One HTTP request to make each tick. `params` names the fetch (it becomes part of
+    the envelope key); `query` and `json` are what is actually sent to the venue. A
+    query value may be a list to repeat a parameter (`?slug=a&slug=b`)."""
 
     endpoint: str
     url: str
     params: Mapping[str, str] = field(default_factory=dict)
-    query: Mapping[str, str] = field(default_factory=dict)
+    query: Mapping[str, str | list[str]] = field(default_factory=dict)
+    method: str = "GET"
+    json: Any = None  # request body for POST
 
 
 class Recorder(ABC):
@@ -58,8 +61,8 @@ class Recorder(ABC):
         self._max_lateness_ms = max_lateness_ms
 
     @abstractmethod
-    async def fetch_specs(self) -> list[FetchSpec]:
-        """The requests to make this tick (may be discovered dynamically)."""
+    async def fetch_specs(self, snapshot_ts: int) -> list[FetchSpec]:
+        """The requests to make for this tick (may depend on discovered state)."""
 
     async def run_forever(self, stop: asyncio.Event) -> None:
         log.info("%s recorder started", self.venue)
@@ -83,7 +86,7 @@ class Recorder(ABC):
         log.info("%s recorder stopped", self.venue)
 
     async def run_tick(self, snapshot_ts: int) -> list[PublishResult]:
-        specs = await self.fetch_specs()
+        specs = await self.fetch_specs(snapshot_ts)
         # All fetches start together, so every endpoint is captured within the same
         # fraction of a second. That is the point of using async here.
         envelopes = await asyncio.gather(*(self._fetch(spec, snapshot_ts) for spec in specs))
@@ -95,8 +98,12 @@ class Recorder(ABC):
         for attempt in range(self._retries + 1):
             request_ts = self._clock()
             try:
-                response = await self._client.get(
-                    spec.url, params=dict(spec.query), timeout=self._timeout_s
+                response = await self._client.request(
+                    spec.method,
+                    spec.url,
+                    params=dict(spec.query),
+                    json=spec.json,
+                    timeout=self._timeout_s,
                 )
                 recv_ts = self._clock()
                 if response.status_code == 200:

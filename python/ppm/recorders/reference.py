@@ -21,7 +21,7 @@ class ReferenceRecorder(Recorder):
     binance_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
     coinbase_products: tuple[str, ...] = ("BTC-USD", "ETH-USD")
 
-    async def fetch_specs(self) -> list[FetchSpec]:
+    async def fetch_specs(self, snapshot_ts: int) -> list[FetchSpec]:
         specs = [
             # limit=2: the candle that just closed plus the one now forming. The parser
             # keeps only the closed one.

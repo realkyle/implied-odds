@@ -25,7 +25,7 @@ class KalshiRecorder(Recorder):
     venue = "kalshi"
     series: tuple[str, ...] = ("KXBTCD", "KXBTC", "KXETHD", "KXETH")
 
-    async def fetch_specs(self) -> list[FetchSpec]:
+    async def fetch_specs(self, snapshot_ts: int) -> list[FetchSpec]:
         return [
             FetchSpec(
                 endpoint="markets",
