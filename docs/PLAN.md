@@ -167,7 +167,7 @@ About 10 weeks part-time. Phase 0 starts immediately because the dataset grows w
 - [x] Polymarket recorder: BTC/ETH "above" and "price on" ladders, CLOB top of book and depth (top 5 levels)
 - [x] Reference prices: Binance BTC/USDT 1m candle (Polymarket's settlement source), Coinbase BTC-USD (BRTI proxy)
 - [x] Settlement collector: Kalshi results and settlement values, Polymarket outcomes, Binance close at each settle time
-- [ ] Common schema, one Parquet file per venue per day, UTC timestamps
+- [x] Common schema, one Parquet file per table per day (`data/tables/`), UTC timestamps
 - [ ] Runs unattended (cron, systemd or a small cloud VM) with logging and restart
 
 Done when: 48 hours of clean, aligned snapshots on disk.
@@ -181,7 +181,8 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 - [ ] Exchange timestamp and local receive timestamp on every row; per-venue clock skew and latency logged
 - [x] Schema validation on write; bad rows go to a quarantine file
 - [ ] Backpressure: bounded buffers when Redis or the writer falls behind, a writer-lag alert, and a slow-writer test
-- [ ] Daily hash chain: manifest of SHA-256(file + previous hash), verified before analysis; tampering test
+- [x] Daily hash chain: manifest of SHA-256(file + previous hash) with append-only amendments; `ppm verify`; tampering tests (modify, delete, swap, insert, edit, reorder, truncate)
+- [ ] Run `ppm verify` automatically before every analysis/backtest (when analysis exists)
 - [ ] Failure test: kill each recorder and the writer mid-run and cut the network; zero lost or duplicated rows; recovery time recorded
 
 *Stage 1.5: operations*
