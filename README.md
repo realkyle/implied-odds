@@ -42,7 +42,8 @@ surface, and tests whether the gaps survive fees, hedging costs and the venues' 
 | Kalshi: every open BTC/ETH "above" and range market | ✅ Recording |
 | Polymarket: BTC/ETH "above" and range ladders, 5-level order books | ✅ Recording |
 | Reference prices: Binance 1m candles (Polymarket's settlement), Coinbase (BRTI proxy) | ✅ Recording |
-| Settlement collector, daily merge + hash-chained manifest, failure/kill tests | 🔨 Next |
+| Settlement collector: Kalshi results + actual BRTI values, Polymarket resolutions, Binance settlement candles | ✅ Running hourly |
+| Daily merge + hash-chained manifest, failure/kill tests | 🔨 Next |
 | Docker Compose for all services, Prometheus/Grafana, alerts, cloud VM (Terraform) | 📋 Planned |
 | C++ pricing core: Black-76, IV solver, SVI/SSVI fit, arbitrage checks, skew-corrected digitals | 📋 Planned |
 | Contract matching, divergence analysis, calibration, backtest with costs | 📋 Planned |
@@ -103,6 +104,8 @@ All numbers below were measured on a laptop and are recorded in the project log.
 | Writer crash recovery | 18 queued snapshots drained in < 8 s, 0 lost, 0 duplicated |
 | Rows quarantined in live runs | 0 |
 | Polymarket range-ladder sanity check | Mid prices sum to 1.024 (≈ 1 plus the bid-ask spread) |
+| Settlement cross-check | All 22 resolved Polymarket BTC contracts on 2026-11-10 agree with the Binance noon close and our bracket rules |
+| Kalshi settlement delay after close | Median 166 s (max 731 s) |
 | Laptop overnight coverage | **12.6%**: the Mac slept on battery. This is why the recorder moves to a cloud VM next |
 
 Not yet measured: kill and network-cut tests under load, Redis outage replay, and multi-week uptime. These are on the Phase 0 checklist.
@@ -119,7 +122,7 @@ Not yet measured: kill and network-cut tests under load, Redis outage replay, an
 cpp/                  C++ core (pricing, surface, solvers); tests and benchmarks
 python/ppm/
   pipeline/           envelope, Redis bus with disk spool, minute clock
-  recorders/          deribit, kalshi, polymarket, reference
+  recorders/          deribit, kalshi, polymarket, reference, settlements
   writer/             parsers, Arrow schemas, atomic storage, consumer loop
   tests/              unit tests + real API responses as fixtures
 docs/PLAN.md          math, data sources, phases and checklists
@@ -142,7 +145,7 @@ All venue data used is public; no API keys are needed.
 
 ## Roadmap
 
-0. **Data recording**: pipeline and recorders (built); settlements, hash-chained daily files, monitoring, cloud VM (next)
+0. **Data recording**: pipeline, recorders and settlement collector (built); cloud VM, hash-chained daily files, monitoring (next)
 1. **C++ core**: Black-76 and Greeks, implied-vol solver, SVI per expiry and SSVI across expiries, arbitrage checks
 2. **Digital pricing**: skew-corrected digital and range prices, density extraction
 3. **Matching**: map each contract to strike, settlement time and index; query the surface at that exact time
