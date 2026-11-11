@@ -15,12 +15,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Ninja (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - name: Install Ninja (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ninja
+      # Ninja from PyPI (pipx is preinstalled on GitHub runners): one step for both OSes,
+      # and no dependency on apt mirrors, which failed to resolve on 2026-11-11.
+      - name: Install Ninja
+        run: pipx install ninja
       - run: cmake --preset dev
       - run: cmake --build --preset dev
       - run: ctest --preset dev
