@@ -139,13 +139,20 @@ Tests: modify one byte, delete, swap, insert an extra file, edit an entry, forge
 
 ## 7. Failure tests (each one gives a measured number for the WorkLog)
 
-| Test | Pass condition | Measured |
+Run with `uv run ppm faulttest [--scenario …] [--outage-s 300]` from the repo root. It starts an isolated `ppmtest` Compose stack (Redis, writer, deribit, kalshi, polymarket, reference; settlements is left out so a second copy can't get the live stack rate-limited), injects each fault, tears the stack down and writes `.faulttest/run-<ts>/report.json`. A test-only override (`docker-compose.faulttest.yml`) puts Redis on an internal network and gives recorders a second `egress` network, so the internet can be cut without cutting Redis. The verdict comes from three independent witnesses: the recorders' per-tick log line (`N published, M spooled`), a census of every message on the Redis streams (taken inside the writer container), and the `fetch_log` rows in staging. Staging files are named by (tick, venue, key), so a redelivery overwrites instead of adding a row; the census is what shows whether duplicate deliveries happened and were absorbed. Code: `python/ppm/faulttest/` (`analysis.py` is pure and unit-tested).
+
+| Test | Pass condition | Measured (2026-11-12, laptop, final full run `run-20261112T162258Z`) |
 |---|---|---|
-| Kill the writer mid-batch, restart | 0 lost, 0 duplicated rows | Recovery time (s), messages redelivered |
-| Kill each recorder, restart | Only the ticks while it was down are missing; logged as a gap | Gap length vs. downtime |
-| Stop Redis for 5 min | Recorders spool to disk and replay; 0 lost | Spool size, replay time |
-| Cut the network for 5 min | Gaps logged with start, end and cause; recording resumes on its own | Resume latency |
-| Slow writer | Lag alert fires; 0 lost after catch-up | Peak lag |
+| Kill the writer mid-batch: freeze it (SIGSTOP) just after a tick until it holds delivered-but-unacked messages, sample the queue, SIGKILL | ≥ 1 message pending at the kill; 0 lost, 0 duplicated rows | Restarted in **0.2 s**, queue drained **1.1 s** after the kill; **1 redelivered**, 25 queued while down (first attempt, frozen at tick + 0.4 s). A kill at a fixed offset proved unreliable: the writer drains a tick in 0.3–2 s |
+| Kill each recorder mid-fetch (tick + 0.2 s), restart | Only the ticks while it was down are missing | Down **0.3–0.4 s** each; gap of **1 tick** (deribit, polymarket, reference); kalshi **0** (it had already published, ~0.3 s after the tick, before the signal landed; same in all three runs). The gap is found by the harness afterwards; nothing logs it live yet (see the silent-venue alert in Stage 1.5) |
+| Stop Redis for 5 min | Recorders spool to disk and replay; 0 lost | **170 envelopes / 1.16 MB** spooled; replayed at the next tick: spool empty **1.0 s** after that tick, queue drained 2.5 s after it (51 s after Redis came back, which was 10 s past a tick) |
+| Cut the internet for 5 min | Every tick still leaves rows with a cause; recording resumes on its own | **5 error ticks** per venue with the cause stored, **0 silent gaps**; every venue OK again on the first tick after reconnecting (~50.3 s later, i.e. bounded by the 60 s tick) |
+| Whole run | 0 lost, 0 duplicated; census agrees both ways | **759 sent, 759 delivered, 759 stored: 0 lost, 0 duplicated, 0 dropped**, 3 allowed gaps (the recorder kills), 0 unexpected or unlogged. 0 extra stream deliveries (no crash landed mid spool-replay, so that duplicate path is covered by unit tests only) |
+| Slow writer | Lag alert fires; 0 lost after catch-up | Not built yet (backpressure item) |
+
+Recovery after Redis or network outages is bounded by the tick: recorders only publish (and so replay the spool) and fetch on a tick. A 2 GiB spool at the measured ~0.24 MB/min for four venues lasts roughly 6 days of Redis downtime.
+
+The harness's own guards caught two of its bugs during development (a writer kill that often missed the batch, and a census not wired into the verdict). Details are in the project log.
 
 ## 8. Code layout (Stage 1)
 

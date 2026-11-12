@@ -4,6 +4,7 @@ ppm record <venue>    run one venue recorder (one OS process per venue)
 ppm writer            run the Parquet writer
 ppm merge [--loop]    merge finished days into hash-chained daily files
 ppm verify            check the manifest hash chain and every file hash
+ppm faulttest         inject faults into an isolated Compose stack; prove 0 lost / 0 duplicated
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import httpx
 from redis.asyncio import Redis
 
 from ppm.config import Settings
+from ppm.faulttest.runner import SCENARIOS as FAULT_SCENARIOS
+from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
@@ -154,7 +157,18 @@ def main(argv: list[str] | None = None) -> None:
     mrg.add_argument("--loop", action="store_true", help="run hourly as a service")
     ver = sub.add_parser("verify", help="verify the manifest hash chain and file hashes")
     ver.add_argument("--expect-head", help="fail unless the chain ends at this value")
+    flt = sub.add_parser("faulttest", help="failure test on an isolated ppmtest Compose stack")
+    flt.add_argument(
+        "--scenario",
+        action="append",
+        choices=FAULT_SCENARIOS,
+        help="run only this scenario (repeatable; default: all)",
+    )
+    flt.add_argument("--outage-s", type=float, default=300.0, help="Redis/network outage length")
     args = ap.parse_args(argv)
+
+    if args.command == "faulttest":  # drives Docker; needs no Settings or service logging
+        sys.exit(faulttest_main(args.scenario, args.outage_s))
 
     _configure_logging()
     settings = Settings.from_env()
