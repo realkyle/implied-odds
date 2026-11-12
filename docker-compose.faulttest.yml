@@ -1,0 +1,52 @@
+# Test-only override for `ppm faulttest` (never used by the live stack).
+#
+#   docker compose -p ppmtest -f docker-compose.yml -f docker-compose.faulttest.yml up -d
+#
+# Splits the single default network in two so the internet can be cut on its own:
+#   backend  internal (no route out): Redis and every ppm service talk here
+#   egress   normal bridge with internet: recorders only
+# `docker network disconnect ppmtest_egress <recorder>` then drops the venues while Redis
+# stays reachable, like a home Wi-Fi or ISP outage. The Redis outage is its own scenario.
+#
+# Every ppm service also gets its own image tag, so `up --build` here never retags the
+# `ppm:latest` image that the default (live) project would start from.
+
+networks:
+  backend:
+    internal: true
+  egress: {}
+
+services:
+  redis:
+    networks: [backend]
+    # No host port: an internal network can't publish one, and the harness talks to Redis
+    # through `docker compose exec redis redis-cli`. `!reset` drops the base file's list.
+    ports: !reset []
+
+  writer:
+    image: ppm:faulttest
+    networks: [backend]
+
+  deribit:
+    image: ppm:faulttest
+    networks: [backend, egress]
+
+  kalshi:
+    image: ppm:faulttest
+    networks: [backend, egress]
+
+  polymarket:
+    image: ppm:faulttest
+    networks: [backend, egress]
+
+  reference:
+    image: ppm:faulttest
+    networks: [backend, egress]
+
+  settlements:
+    image: ppm:faulttest
+    networks: [backend, egress]
+
+  merger:
+    image: ppm:faulttest
+    networks: [backend]

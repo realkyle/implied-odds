@@ -42,3 +42,6 @@ spool/
 # Interim laptop runner state
 run/
 logs/
+
+# Failure-test runs (ppm faulttest)
+.faulttest/

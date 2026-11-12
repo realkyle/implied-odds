@@ -183,7 +183,7 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 - [ ] Backpressure: bounded buffers when Redis or the writer falls behind, a writer-lag alert, and a slow-writer test
 - [x] Daily hash chain: manifest of SHA-256(file + previous hash) with append-only amendments; `ppm verify`; tampering tests (modify, delete, swap, insert, edit, reorder, truncate)
 - [ ] Run `ppm verify` automatically before every analysis/backtest (when analysis exists)
-- [ ] Failure test: kill each recorder and the writer mid-run and cut the network; zero lost or duplicated rows; recovery time recorded
+- [x] Failure test (`ppm faulttest`, isolated `ppmtest` stack): kill each recorder and the writer mid-run, stop Redis for 5 min, and cut the internet for 5 min; zero lost or duplicated rows; recovery time recorded (2026-11-12: 759 sent/delivered/stored, 0 lost, 0 dup; writer back in 0.2 s; numbers in design §7)
 
 *Stage 1.5: operations*
 - [x] Dockerfile + docker-compose for every service (one image, one service per process), restart policies; writer SIGKILL test: back in 0.9 s, 0 lost / 0 duplicated
