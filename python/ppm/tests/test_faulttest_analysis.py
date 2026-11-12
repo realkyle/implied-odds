@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC, datetime
 
 import pyarrow as pa
 import pytest
 from ppm.faulttest import analysis as a
+from ppm.monitor.watch import iso
 from ppm.pipeline.clock import TICK_MS
 from ppm.tests.conftest import make_envelope
 from ppm.writer.schemas import SCHEMAS
@@ -301,6 +303,139 @@ def test_net_cut_needs_error_rows_no_gaps_and_recovery():
     assert not a.evaluate_net_cut(a.NetCut(("deribit",), cut, restore), logs, never_back).passed
 
 
+# --- venue monitor ---------------------------------------------------------------------
+
+
+def mline(time_ms: int, text: str, level: str = "ERROR") -> str:
+    """A monitor log line exactly as `ppm monitor` writes it (UTC asctime + 'Z')."""
+    when = datetime.fromtimestamp(time_ms / 1000, UTC)
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S,") + f"{when.microsecond // 1000:03d}"
+    return f"{stamp}Z {level} ppm.monitor: {text}"
+
+
+def gap_line(venue: str, first: int, last: int, at: int) -> str:
+    n = (last - first) // TICK_MS + 1
+    return mline(
+        at,
+        f"GAP venue={venue} first={iso(first)} last={iso(last)} ticks={n} "
+        f"detected_after_s={(at - first) / 1000:.1f}",
+        "WARNING",
+    )
+
+
+def test_parse_monitor_logs_reads_time_label_and_fields():
+    lines = [
+        "noise",
+        mline(
+            T[2] + 1_250,
+            "ALERT kind=unreachable venue=redis down_for_s=60.0 error='ConnectionError'",
+        ),
+        gap_line("kalshi", T[1], T[3], T[4] + 900),
+        "2026-11-12 14:30:00,000Z INFO ppm.monitor: monitor seeded: deribit last=1",
+    ]
+    out = a.parse_monitor_logs(lines)
+    assert [(m.time_ms, m.label, m.kind, m.venue) for m in out] == [
+        (T[2] + 1_250, "ALERT", "unreachable", "redis"),
+        (T[4] + 900, "GAP", None, "kalshi"),
+    ]
+    assert out[0].fields["error"] == "ConnectionError"
+    assert out[1].gap_ticks() == [T[1], T[2], T[3]]
+
+
+def monitor_check(monitor_lines, gaps, events=()):
+    integrity = a.Integrity(allowed_gaps={"recorder-kill": gaps} if gaps else {})
+    return a.evaluate_monitor(a.parse_monitor_logs(monitor_lines), integrity, events, T[0], T[9])
+
+
+def test_monitor_gaps_must_equal_the_harness_gaps():
+    gaps = [("deribit", T[3]), ("kalshi", T[5])]
+    lines = [
+        gap_line("deribit", T[3], T[3], T[4] + 800),
+        gap_line("kalshi", T[5], T[5], T[6] + 900),
+    ]
+    r = monitor_check(lines, gaps)
+    assert r.passed, r.notes
+    assert r.measured["gap_ticks"] == 2 and r.measured["max_gap_detect_s"] == 60.9
+
+    missed = monitor_check(lines[:1], gaps)
+    assert not missed.passed and "missed" in missed.notes[0]
+    invented = monitor_check([*lines, gap_line("reference", T[7], T[7], T[8])], gaps)
+    assert not invented.passed and "didn't see" in invented.notes[0]
+
+
+def test_gap_ticks_outside_the_checked_range_are_ignored():
+    early = gap_line("deribit", T[0] - TICK_MS, T[0] - TICK_MS, T[0] + 500)
+    assert monitor_check([early], []).passed
+
+
+def test_an_alert_no_fault_explains_fails_the_monitor():
+    stop = a.RecorderStop("kalshi", T[1] + 10_000, T[4] + 30_000)
+    silent = mline(T[3] + 32_000, "ALERT kind=silent venue=kalshi last=x silent_for_s=152.0")
+    assert monitor_check([silent], [], [stop]).passed
+    wrong_venue = silent.replace("kalshi", "deribit")
+    r = monitor_check([wrong_venue], [], [stop])
+    assert not r.passed and "unexplained alert" in r.notes[0]
+    assert not monitor_check([silent], []).passed  # no fault at all
+
+
+def test_recorder_stop_needs_silent_alert_recovery_and_gap():
+    stop, start = T[1] + 10_000, T[4] + 30_000
+    e = a.RecorderStop("kalshi", stop, start)
+    lines = [
+        mline(T[1] + 152_000, "ALERT kind=silent venue=kalshi last=x silent_for_s=152.0"),
+        mline(T[5] + 800, "RECOVERED kind=silent venue=kalshi down_for_s=240.8", "WARNING"),
+        gap_line("kalshi", T[2], T[4], T[5] + 800),
+    ]
+    r = a.evaluate_recorder_stop(e, a.parse_monitor_logs(lines))
+    assert r.passed, r.notes
+    assert r.measured["alert_after_last_tick_s"] == 152.0
+    assert r.measured["alert_after_stop_s"] == 142.0
+    assert r.measured["gap_ticks"] == 3
+    assert r.measured["gap_reported_after_restart_s"] == 30.8
+    for drop in range(3):
+        partial = a.parse_monitor_logs(lines[:drop] + lines[drop + 1 :])
+        assert not a.evaluate_recorder_stop(e, partial).passed
+    late = a.RecorderStop("kalshi", stop, T[1] + 100_000)  # back before the alert
+    assert not a.evaluate_recorder_stop(late, a.parse_monitor_logs(lines)).passed
+
+
+def test_net_cut_needs_a_failing_alert_and_recovery_per_venue():
+    cut, restore = T[1] + 10_000, T[6] + 10_000
+    logs = [a.TickLog("deribit", t, published=1) for t in T[:9]]
+    ok = (T[0], T[1], T[7], T[8])
+    rows = [row("deribit", t, status="200" if t in ok else "error") for t in T[:9]]
+    e = a.NetCut(("deribit",), cut, restore)
+    lines = [
+        mline(T[5] + 2_000, "ALERT kind=failing venue=deribit first=x ticks=3"),
+        mline(T[7] + 900, "RECOVERED kind=failing venue=deribit down_for_s=300.9", "WARNING"),
+    ]
+    r = a.evaluate_net_cut(e, logs, rows, a.parse_monitor_logs(lines))
+    assert r.passed, r.notes
+    assert r.measured["failing_alert_s"] == 232.0
+    r = a.evaluate_net_cut(e, logs, rows, a.parse_monitor_logs(lines[:1]))
+    assert not r.passed and "kind=failing" in r.notes[-1]
+    assert a.evaluate_net_cut(e, logs, rows).passed  # monitor not given: not checked
+
+
+def test_redis_outage_needs_the_unreachable_alert_and_recovery():
+    logs = [a.TickLog("deribit", T[1], spooled=4)]
+    e = a.RedisOutage(T[0] + 10_000, T[5] + 10_000, 4, 2_000_000, T[6] + 3_000, T[6] + 4_000)
+    lines = [
+        mline(T[1] + 12_000, "ALERT kind=unreachable venue=redis down_for_s=62.0 error='x'"),
+        mline(T[5] + 15_000, "RECOVERED kind=unreachable venue=redis down_for_s=303.0", "WARNING"),
+    ]
+    r = a.evaluate_redis_outage(e, logs, a.parse_monitor_logs(lines))
+    assert r.passed and r.measured["alert_s"] == 62.0
+    assert not a.evaluate_redis_outage(e, logs, a.parse_monitor_logs(lines[1:])).passed
+
+
+def test_recorder_stop_window_allows_gaps_for_that_venue():
+    e = a.RecorderStop("kalshi", T[1] + 10_000, T[4] + 30_000)
+    assert a.windows_for([e]) == [
+        a.FaultWindow("recorder-stop", frozenset({"kalshi"}), e.stop_ms, e.start_ms, True)
+    ]
+
+
 # --- helpers ---------------------------------------------------------------------------
 
 
@@ -349,3 +484,33 @@ def test_read_fetch_log_from_staging(tmp_path):
     )
     store.write_table("fetch_log", env, table)
     assert a.read_fetch_log(tmp_path) == [a.FetchRow(env.venue, env.key, T0, "200", T0 + 250, None)]
+
+
+def test_recorder_stop_fails_on_an_early_alert_or_early_recovery():
+    stop, start = T[1] + 10_000, T[4] + 30_000
+    e = a.RecorderStop("kalshi", stop, start)
+    early = [
+        mline(T[1] + 100_000, "ALERT kind=silent venue=kalshi last=x silent_for_s=100.0"),
+        mline(T[5] + 800, "RECOVERED kind=silent venue=kalshi down_for_s=240.8", "WARNING"),
+        gap_line("kalshi", T[2], T[4], T[5] + 800),
+    ]
+    r = a.evaluate_recorder_stop(e, a.parse_monitor_logs(early))
+    assert not r.passed and "before the threshold" in r.notes[0]
+    back_early = [
+        mline(T[1] + 152_000, "ALERT kind=silent venue=kalshi last=x silent_for_s=152.0"),
+        mline(T[3] + 900, "RECOVERED kind=silent venue=kalshi down_for_s=120.9", "WARNING"),
+        gap_line("kalshi", T[2], T[4], T[5] + 800),
+    ]
+    r = a.evaluate_recorder_stop(e, a.parse_monitor_logs(back_early))
+    assert not r.passed and "before the recorder was restarted" in r.notes[0]
+
+
+def test_short_outages_do_not_require_monitor_alerts():
+    cut, restore = T[1] + 10_000, T[4] + 10_000  # only 3 error ticks, last not judged in time
+    logs = [a.TickLog("deribit", t, published=1) for t in T[:7]]
+    rows = [
+        row("deribit", t, status="200" if t in (T[0], T[1], T[5], T[6]) else "error") for t in T[:7]
+    ]
+    assert a.evaluate_net_cut(a.NetCut(("deribit",), cut, restore), logs, rows, []).passed
+    short = a.RedisOutage(T[0] + 10_000, T[0] + 50_000, 4, 10, T[1] + 3_000, T[1] + 4_000)
+    assert a.evaluate_redis_outage(short, [a.TickLog("deribit", T[0], spooled=4)], []).passed

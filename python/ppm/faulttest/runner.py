@@ -28,8 +28,12 @@ from ppm.pipeline.clock import TICK_MS, floor_tick, next_tick, now_ms
 RECORDERS = ("deribit", "kalshi", "polymarket", "reference")
 # settlements is left out: it refetches ~53 Kalshi pages on every start, and a second copy
 # could get the *live* stack rate-limited. It shares its kill/restart code (Recorder base).
-SERVICES = ("redis", "writer", *RECORDERS)
-SCENARIOS = ("writer-kill", "recorder-kill", "redis-outage", "net-cut")
+SERVICES = ("redis", "writer", "monitor", *RECORDERS)
+SCENARIOS = ("writer-kill", "recorder-kill", "recorder-stop", "redis-outage", "net-cut")
+# recorder-stop: long enough to pass the monitor's silence threshold (2.5 ticks = 150 s
+# after the last tick) with margin, short enough to keep the run quick.
+STOP_VENUE = "kalshi"
+STOP_S = 200.0
 ALL_STREAMS = ("deribit", "kalshi", "polymarket", "reference", "settlements")
 
 
@@ -214,6 +218,20 @@ def recorder_kills(stack: Stack) -> list[a.RecorderKill]:
     return kills
 
 
+def recorder_stop(stack: Stack, venue: str = STOP_VENUE, down_s: float = STOP_S) -> a.RecorderStop:
+    """Stop one recorder cleanly (as `docker compose stop` would on a hung or crashed-
+    and-not-restarted process) so the monitor sees real silence, then start it again."""
+    _at_tick(10)  # its tick is logged; it is stopped between ticks
+    stop = now_ms()
+    stack.compose("stop", venue)
+    _sleep_to(stop + int(down_s * 1000))
+    start = now_ms()
+    stack.compose("start", venue)
+    # The monitor reports RECOVERED and the GAP when the first tick after the restart lands.
+    _sleep_to(next_tick(now_ms()) + 30_000)
+    return a.RecorderStop(venue, stop, start)
+
+
 def redis_outage(stack: Stack, outage_s: float) -> a.RedisOutage:
     _at_tick(10)  # between ticks, so the outage starts cleanly
     stop = now_ms()
@@ -270,6 +288,9 @@ def run(repo: Path, scenarios: list[str], outage_s: float) -> int:
         if "recorder-kill" in scenarios:
             _say("recorder-kill: SIGKILL each recorder mid-fetch, one per tick")
             events.extend(recorder_kills(stack))
+        if "recorder-stop" in scenarios:
+            _say(f"recorder-stop: stop {STOP_VENUE} for {STOP_S:.0f} s (monitor must alert)")
+            events.append(recorder_stop(stack))
         if "redis-outage" in scenarios:
             _say(f"redis-outage: stop Redis for {outage_s:.0f} s")
             events.append(redis_outage(stack, outage_s))
@@ -288,6 +309,8 @@ def run(repo: Path, scenarios: list[str], outage_s: float) -> int:
         logs_text = stack.logs(*RECORDERS)
         (run_dir / "recorders.log").write_text("\n".join(logs_text))
         (run_dir / "writer.log").write_text("\n".join(stack.logs("writer")))
+        monitor_text = stack.logs("monitor")
+        (run_dir / "monitor.log").write_text("\n".join(monitor_text))
     finally:
         _say("tearing down the ppmtest stack (data in the run directory is kept)")
         stack.down()
@@ -303,7 +326,9 @@ def run(repo: Path, scenarios: list[str], outage_s: float) -> int:
         a.windows_for(events),
         a.parse_census(census_text) if census_text is not None else None,
     )
-    results = _evaluate(events, logs, rows, integrity)
+    monitor = a.parse_monitor_logs(monitor_text)
+    results = _evaluate(events, logs, rows, integrity, monitor)
+    results.append(a.evaluate_monitor(monitor, integrity, events, start_ms, last_tick))
     table = a.format_table(results, integrity)
     print(table)
     report = {
@@ -338,17 +363,23 @@ def run(repo: Path, scenarios: list[str], outage_s: float) -> int:
 
 
 def _evaluate(
-    events: list[object], logs: list[a.TickLog], rows: list[a.FetchRow], integrity: a.Integrity
+    events: list[object],
+    logs: list[a.TickLog],
+    rows: list[a.FetchRow],
+    integrity: a.Integrity,
+    monitor: list[a.MonitorLine],
 ) -> list[a.ScenarioResult]:
     results: list[a.ScenarioResult] = []
     kills = [e for e in events if isinstance(e, a.RecorderKill)]
     for e in events:
         if isinstance(e, a.WriterKill):
             results.append(a.evaluate_writer_kill(e, integrity))
+        elif isinstance(e, a.RecorderStop):
+            results.append(a.evaluate_recorder_stop(e, monitor))
         elif isinstance(e, a.RedisOutage):
-            results.append(a.evaluate_redis_outage(e, logs))
+            results.append(a.evaluate_redis_outage(e, logs, monitor))
         elif isinstance(e, a.NetCut):
-            results.append(a.evaluate_net_cut(e, logs, rows))
+            results.append(a.evaluate_net_cut(e, logs, rows, monitor))
     if kills:
         results.append(a.evaluate_recorder_kills(kills, logs, rows))
     order = {name: i for i, name in enumerate(SCENARIOS)}

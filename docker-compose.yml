@@ -75,5 +75,15 @@ services:
     <<: *ppm
     command: ["merge", "--loop"]
 
+  # Alerts when a venue goes silent or only fails; logs every missing tick. Reads the
+  # streams read-only (XREAD), never the writer's consumer group. Phone pushes need
+  # PPM_NTFY_TOPIC (from the shell or the git-ignored .env); without it, log only.
+  monitor:
+    <<: *ppm
+    command: ["monitor"]
+    environment: # replaces the anchor's map (YAML merge is shallow), so repeat REDIS_URL
+      REDIS_URL: redis://redis:6379/0
+      PPM_NTFY_TOPIC: ${PPM_NTFY_TOPIC:-}
+
 volumes:
   redis-data:
