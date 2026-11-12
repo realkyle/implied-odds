@@ -23,9 +23,12 @@ data/
 
 # Personal working files (kept local for now)
 CLAUDE.md
+CLAUDE.md.bak
 addon.md
 docs/WorkLog.md
 docs/CodeGuide.md
+docs/systems-menu.md
+docs/claude-md-addon.md
 .claude/settings.local.json
 
 # OS / editors

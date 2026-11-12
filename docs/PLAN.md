@@ -177,7 +177,7 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 *Stage 1: pipeline (REST polling)*
 - [x] One process per venue, so one venue failing never stops the others
 - [x] Recorders publish to Redis Streams; a separate writer consumes into Parquet
-- [ ] Idempotent writes: a replayed message never creates a duplicate row
+- [x] Idempotent writes: a replayed message never creates a duplicate row (deterministic file names + daily dedup; `test_redelivered_message_does_not_duplicate_rows`; Compose kill test 146/146 exactly once)
 - [ ] Exchange timestamp and local receive timestamp on every row; per-venue clock skew and latency logged
 - [x] Schema validation on write; bad rows go to a quarantine file
 - [ ] Backpressure: bounded buffers when Redis or the writer falls behind, a writer-lag alert, and a slow-writer test
