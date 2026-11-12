@@ -4,6 +4,7 @@ ppm record <venue>    run one venue recorder (one OS process per venue)
 ppm writer            run the Parquet writer
 ppm merge [--loop]    merge finished days into hash-chained daily files
 ppm verify            check the manifest hash chain and every file hash
+ppm monitor           alert when a venue goes silent or only fails; log every missing tick
 ppm faulttest         inject faults into an isolated Compose stack; prove 0 lost / 0 duplicated
 """
 
@@ -23,6 +24,9 @@ from ppm.config import Settings
 from ppm.faulttest.runner import SCENARIOS as FAULT_SCENARIOS
 from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
+from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
+from ppm.monitor.service import Monitor, build_watches
+from ppm.monitor.watch import ProbeAlert
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
@@ -133,6 +137,44 @@ def _merge_summary(report) -> str:
     )
 
 
+async def _monitor(settings: Settings, test_notify: bool) -> int:
+    async with httpx.AsyncClient() as client:
+        ntfy = NtfyNotifier(settings.ntfy_topic, client) if settings.ntfy_topic else None
+        notifier: Notifier = FanoutNotifier([LogNotifier(), *([ntfy] if ntfy else [])])
+        if test_notify:
+            await LogNotifier().notify(ProbeAlert())
+            if ntfy is None:
+                print("PPM_NTFY_TOPIC is not set: the alert was only logged")
+                return 1
+            delivered = await ntfy.send(ProbeAlert())
+            print("ntfy accepted the test push" if delivered else "ntfy push FAILED (see log)")
+            return 0 if delivered else 1
+
+        stop = _stop_event()
+        # Socket timeout above the 5 s blocking read (see `_write`).
+        redis = Redis.from_url(settings.redis_url, socket_timeout=30, socket_connect_timeout=5)
+        venues = settings.monitor_venues or tuple(RECORDERS)
+        unknown = sorted(set(venues) - set(RECORDERS))
+        if unknown:
+            print(f"PPM_MONITOR_VENUES: unknown venue(s) {unknown}", file=sys.stderr)
+            return 2
+        watches = build_watches(
+            {venue: RECORDERS[venue].tick_ms for venue in venues},
+            settings.monitor_silent_ticks,
+            settings.monitor_failing_ticks,
+            now_ms(),
+        )
+        logging.getLogger("ppm.monitor").info(
+            "thresholds: silent after %.1f ticks, failing after %d ticks, ntfy %s",
+            settings.monitor_silent_ticks,
+            settings.monitor_failing_ticks,
+            "on" if ntfy else "off",
+        )
+        await Monitor(redis, watches, notifier).run_forever(stop)
+        await redis.aclose()
+    return 0
+
+
 def _verify(settings: Settings, expect_head: str | None) -> int:
     manifest = Manifest(settings.data_dir)
     problems = manifest.verify(expect_head=expect_head)
@@ -157,6 +199,8 @@ def main(argv: list[str] | None = None) -> None:
     mrg.add_argument("--loop", action="store_true", help="run hourly as a service")
     ver = sub.add_parser("verify", help="verify the manifest hash chain and file hashes")
     ver.add_argument("--expect-head", help="fail unless the chain ends at this value")
+    mon = sub.add_parser("monitor", help="alert on silent or failing venues; log missing ticks")
+    mon.add_argument("--test-notify", action="store_true", help="send one test alert and exit")
     flt = sub.add_parser("faulttest", help="failure test on an isolated ppmtest Compose stack")
     flt.add_argument(
         "--scenario",
@@ -180,6 +224,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_merge(settings, args.date, args.loop))
     elif args.command == "verify":
         sys.exit(_verify(settings, args.expect_head))
+    elif args.command == "monitor":
+        sys.exit(asyncio.run(_monitor(settings, args.test_notify)))
 
 
 if __name__ == "__main__":

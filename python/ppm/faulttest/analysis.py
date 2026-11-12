@@ -12,6 +12,10 @@ From these: **lost** = sent − stored for a (venue, tick); **duplicated** = a k
 more than once; **gap** = a minute tick with neither a log line nor a row. A gap is fine
 only inside a fault window that allows it (a killed recorder can't fetch while dead); a
 network cut must not create gaps, because a failed fetch still publishes an error row.
+
+The venue monitor (`ppm monitor`) is checked against the same evidence: its GAP lines must
+name exactly the harness's gaps, and each fault must raise exactly its expected ALERT
+(and RECOVERED), with no alert anywhere else.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -29,11 +33,21 @@ from ppm.faulttest.stream_census import UNDECODABLE
 from ppm.pipeline.clock import TICK_MS, floor_tick
 
 TEST_PROJECT = "ppmtest"
+# The monitor's defaults (ppm.config): silent after 2.5 ticks, failing after 3 closed ticks,
+# Redis unreachable alert after 60 s.
+MONITOR_SILENT_MS = int(2.5 * TICK_MS)
+MONITOR_FAILING_TICKS = 3
+MONITOR_REDIS_ALERT_MS = 60_000
 
 # "... INFO ppm.recorders.base: deribit tick 1794493440000: 4 published, 2 spooled"
 _TICK_LINE = re.compile(r"ppm\.recorders\.base: (\w+) tick (\d+): (.+?)\s*$")
 _TICK_FAILED = re.compile(r"ppm\.recorders\.base: (\w+) tick (\d+) failed")
 _COUNT = re.compile(r"(\d+) (published|spooled|dropped)")
+# "2026-11-12 18:18:00,373Z ERROR ppm.monitor: ALERT kind=silent venue=kalshi last=... "
+_MONITOR_LINE = re.compile(
+    r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3})Z \w+ ppm\.monitor: (GAP|ALERT|RECOVERED) (.*)$"
+)
+_KV = re.compile(r"(\w+)=('[^']*'|\S+)")
 
 
 def assert_test_project(name: str) -> None:
@@ -345,6 +359,15 @@ class RecorderKill:
 
 
 @dataclass(frozen=True, slots=True)
+class RecorderStop:
+    """A recorder stopped cleanly (`compose stop`) for long enough to count as silent."""
+
+    venue: str
+    stop_ms: int
+    start_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class RedisOutage:
     stop_ms: int
     start_ms: int
@@ -366,12 +389,16 @@ def _s(start: int, end: int | None) -> float | None:
 
 
 def windows_for(events: Iterable[object]) -> list[FaultWindow]:
-    """Fault windows for the integrity check. Only a recorder kill may leave gaps."""
+    """Fault windows for the integrity check. Only a dead recorder (killed or stopped)
+    may leave gaps."""
     out: list[FaultWindow] = []
     for e in events:
         if isinstance(e, RecorderKill):
             end = e.restarted_ms if e.restarted_ms is not None else e.kill_ms + 5 * TICK_MS
             out.append(FaultWindow("recorder-kill", frozenset({e.venue}), e.kill_ms, end, True))
+        elif isinstance(e, RecorderStop):
+            venues = frozenset({e.venue})
+            out.append(FaultWindow("recorder-stop", venues, e.stop_ms, e.start_ms, True))
     return out
 
 
@@ -422,7 +449,9 @@ def evaluate_recorder_kills(
     return r
 
 
-def evaluate_redis_outage(e: RedisOutage, logs: list[TickLog]) -> ScenarioResult:
+def evaluate_redis_outage(
+    e: RedisOutage, logs: list[TickLog], monitor: list[MonitorLine] | None = None
+) -> ScenarioResult:
     spooled = sum(t.spooled for t in logs if e.stop_ms - TICK_MS <= t.tick <= e.start_ms)
     r = ScenarioResult(
         "redis-outage",
@@ -443,10 +472,25 @@ def evaluate_redis_outage(e: RedisOutage, logs: list[TickLog]) -> ScenarioResult
         r.notes.append("spool never emptied")
     if e.drained_ms is None:
         r.notes.append("queue never drained")
+    # Too short to need an alert (the monitor only alerts after 60 s down; allow its 10 s
+    # retry backoff on top).
+    if monitor is not None and e.start_ms - e.stop_ms >= MONITOR_REDIS_ALERT_MS + 10_000:
+        window = [m for m in monitor if e.stop_ms <= m.time_ms <= e.start_ms + 3 * TICK_MS]
+        alert = _first(window, "ALERT", "unreachable", "redis")
+        back = _first(window, "RECOVERED", "unreachable", "redis")
+        r.measured["alert_s"] = None if alert is None else _s(e.stop_ms, alert.time_ms)
+        if alert is None or back is None:
+            r.passed = False
+            r.notes.append("monitor: no ALERT/RECOVERED kind=unreachable for redis")
     return r
 
 
-def evaluate_net_cut(e: NetCut, logs: list[TickLog], rows: list[FetchRow]) -> ScenarioResult:
+def evaluate_net_cut(
+    e: NetCut,
+    logs: list[TickLog],
+    rows: list[FetchRow],
+    monitor: list[MonitorLine] | None = None,
+) -> ScenarioResult:
     """During the cut every tick must still leave error rows with a cause (no silent
     gap), and each venue must recover on its own after the network is back."""
     r = ScenarioResult("net-cut", passed=True, measured={"cut_s": _s(e.cut_ms, e.restore_ms)})
@@ -466,4 +510,159 @@ def evaluate_net_cut(e: NetCut, logs: list[TickLog], rows: list[FetchRow]) -> Sc
         if ok is None:
             r.passed = False
             r.notes.append(f"{venue}: never recovered")
+        # "failing" needs MONITOR_FAILING_TICKS whole error ticks inside the cut, plus a
+        # tick for the last one's fetches to fail and be judged.
+        long_enough = e.restore_ms >= first + MONITOR_FAILING_TICKS * TICK_MS
+        if monitor is not None and long_enough:
+            after = [m for m in monitor if m.time_ms >= e.cut_ms]
+            alert = _first(after, "ALERT", "failing", venue)
+            back = _first(after, "RECOVERED", "failing", venue)
+            if alert is None or back is None or back.time_ms < e.restore_ms:
+                r.passed = False
+                r.notes.append(f"monitor: {venue} has no ALERT then RECOVERED kind=failing")
+            else:
+                worst = r.measured.get("failing_alert_s") or 0.0
+                r.measured["failing_alert_s"] = max(worst, _s(e.cut_ms, alert.time_ms) or 0.0)
+    return r
+
+
+# --- the venue monitor (`ppm monitor` log lines) ---------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorLine:
+    """One GAP / ALERT / RECOVERED line from the monitor's log."""
+
+    time_ms: int  # when the monitor logged it
+    label: str
+    fields: dict[str, str]
+
+    @property
+    def kind(self) -> str | None:
+        return self.fields.get("kind")
+
+    @property
+    def venue(self) -> str | None:
+        return self.fields.get("venue")
+
+    def gap_ticks(self, tick_ms: int = TICK_MS) -> list[int]:
+        first, last = iso_ms(self.fields["first"]), iso_ms(self.fields["last"])
+        return list(range(first, last + 1, tick_ms))
+
+
+def iso_ms(value: str) -> int:
+    """`2026-11-12T17:27:00Z` -> epoch ms."""
+    when = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    return int(when.timestamp()) * 1000
+
+
+def parse_monitor_logs(lines: Iterable[str]) -> list[MonitorLine]:
+    out: list[MonitorLine] = []
+    for line in lines:
+        if m := _MONITOR_LINE.search(line):
+            when = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=UTC)
+            fields = {k: v.strip("'") for k, v in _KV.findall(m.group(3))}
+            out.append(MonitorLine(int(when.timestamp() * 1000), m.group(2), fields))
+    return out
+
+
+def _first(lines: list[MonitorLine], label: str, kind: str, venue: str) -> MonitorLine | None:
+    return next(
+        (m for m in lines if m.label == label and m.kind == kind and m.venue == venue), None
+    )
+
+
+def evaluate_recorder_stop(e: RecorderStop, monitor: list[MonitorLine]) -> ScenarioResult:
+    """While the recorder is stopped the monitor must alert `silent` (not before the
+    threshold), then report RECOVERED and the missing ticks once it is back."""
+    last_tick = floor_tick(e.stop_ms)
+    window = [m for m in monitor if e.stop_ms <= m.time_ms]
+    alert = _first(window, "ALERT", "silent", e.venue)
+    back = _first(window, "RECOVERED", "silent", e.venue)
+    gap = next((m for m in window if m.label == "GAP" and m.venue == e.venue), None)
+    r = ScenarioResult(
+        "recorder-stop",
+        passed=alert is not None and back is not None and gap is not None,
+        measured={
+            "stopped_s": _s(e.stop_ms, e.start_ms),
+            "alert_after_last_tick_s": None if alert is None else _s(last_tick, alert.time_ms),
+            "alert_after_stop_s": None if alert is None else _s(e.stop_ms, alert.time_ms),
+            "gap_ticks": None if gap is None else int(gap.fields["ticks"]),
+            "gap_reported_after_restart_s": None if gap is None else _s(e.start_ms, gap.time_ms),
+        },
+    )
+    if alert is None:
+        r.notes.append(f"monitor: no ALERT kind=silent for {e.venue}")
+    elif alert.time_ms > e.start_ms:
+        r.passed = False
+        r.notes.append("monitor: silent alert came after the recorder was back")
+    elif alert.time_ms - last_tick < MONITOR_SILENT_MS:
+        r.passed = False
+        r.notes.append("monitor: silent alert fired before the threshold")
+    if back is None:
+        r.notes.append(f"monitor: no RECOVERED kind=silent for {e.venue}")
+    elif back.time_ms < e.start_ms:
+        r.passed = False
+        r.notes.append("monitor: RECOVERED before the recorder was restarted")
+    if gap is None:
+        r.notes.append(f"monitor: no GAP for {e.venue}")
+    return r
+
+
+def expected_alert(m: MonitorLine, events: Iterable[object]) -> bool:
+    """Is this ALERT explained by a fault the harness injected?"""
+    for e in events:
+        if isinstance(e, RecorderStop):
+            if (m.kind, m.venue) == ("silent", e.venue) and e.stop_ms <= m.time_ms <= e.start_ms:
+                return True
+        elif isinstance(e, NetCut):
+            if m.kind == "failing" and m.venue in e.venues:
+                if e.cut_ms <= m.time_ms <= e.restore_ms + 2 * TICK_MS:
+                    return True
+        elif isinstance(e, RedisOutage):
+            if (m.kind, m.venue) == ("unreachable", "redis"):
+                if e.stop_ms <= m.time_ms <= e.start_ms + 3 * TICK_MS:
+                    return True
+    return False
+
+
+def evaluate_monitor(
+    monitor: list[MonitorLine],
+    integrity: Integrity,
+    events: Iterable[object],
+    first_tick: int,
+    last_tick: int,
+) -> ScenarioResult:
+    """Run-wide check of the monitor: GAP lines must equal the harness's gaps exactly
+    (none missed, none invented), and every ALERT must be one a fault explains."""
+    events = list(events)
+    harness = {g for gaps in integrity.allowed_gaps.values() for g in gaps}
+    harness |= set(integrity.unexpected_gaps)
+    reported: set[tuple[str, int]] = set()
+    detect: list[float] = []
+    for m in monitor:
+        if m.label == "GAP" and m.venue:
+            ticks = [t for t in m.gap_ticks() if first_tick <= t <= last_tick]
+            reported |= {(m.venue, t) for t in ticks}
+            if ticks:
+                detect.append(float(m.fields["detected_after_s"]))
+    missed, invented = sorted(harness - reported), sorted(reported - harness)
+    alerts = [m for m in monitor if m.label == "ALERT" and first_tick <= m.time_ms]
+    unexplained = [m for m in alerts if not expected_alert(m, events)]
+    r = ScenarioResult(
+        "monitor",
+        passed=not (missed or invented or unexplained),
+        measured={
+            "gap_ticks": len(reported),
+            "harness_gap_ticks": len(harness),
+            "max_gap_detect_s": max(detect, default=None),
+            "alerts": len(alerts),
+        },
+    )
+    if missed:
+        r.notes.append(f"gaps the monitor missed: {missed}")
+    if invented:
+        r.notes.append(f"gaps the monitor reported that the harness didn't see: {invented}")
+    for m in unexplained:
+        r.notes.append(f"unexplained alert: {m.label} {m.fields}")
     return r

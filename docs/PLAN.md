@@ -189,7 +189,7 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 - [x] Dockerfile + docker-compose for every service (one image, one service per process), restart policies; writer SIGKILL test: back in 0.9 s, 0 lost / 0 duplicated
 - [ ] Health checks per service + monitoring containers (with Prometheus)
 - [ ] Prometheus metrics (messages/s, last-message age, gaps, writer lag, reconnects) + Grafana dashboard
-- [ ] Alert when a venue has been silent longer than a threshold
+- [x] Alert when a venue has been silent longer than a threshold (`ppm monitor`: silent after 2.5 ticks, failing after 3 all-error ticks, Redis unreachable after 60 s; live GAP lines; optional ntfy push. faulttest 2026-11-12: silent ALERT 151 s after the last tick, GAP lines = harness gaps 6/6, 0 unexplained alerts)
 - [ ] Data-quality checks: stale quotes, crossed books, out-of-order timestamps, outliers; share caught per venue and day
 
 *Stage 2: streaming and cloud*

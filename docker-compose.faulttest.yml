@@ -50,3 +50,11 @@ services:
   merger:
     image: ppm:faulttest
     networks: [backend]
+
+  monitor:
+    image: ppm:faulttest
+    networks: [backend]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PPM_NTFY_TOPIC: "" # never push test-stack alerts to the owner's phone
+      PPM_MONITOR_VENUES: deribit,kalshi,polymarket,reference # no settlements in this stack

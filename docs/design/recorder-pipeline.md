@@ -144,10 +144,13 @@ Run with `uv run ppm faulttest [--scenario …] [--outage-s 300]` from the repo 
 | Test | Pass condition | Measured (2026-11-12, laptop, final full run `run-20261112T162258Z`) |
 |---|---|---|
 | Kill the writer mid-batch: freeze it (SIGSTOP) just after a tick until it holds delivered-but-unacked messages, sample the queue, SIGKILL | ≥ 1 message pending at the kill; 0 lost, 0 duplicated rows | Restarted in **0.2 s**, queue drained **1.1 s** after the kill; **1 redelivered**, 25 queued while down (first attempt, frozen at tick + 0.4 s). A kill at a fixed offset proved unreliable: the writer drains a tick in 0.3–2 s |
-| Kill each recorder mid-fetch (tick + 0.2 s), restart | Only the ticks while it was down are missing | Down **0.3–0.4 s** each; gap of **1 tick** (deribit, polymarket, reference); kalshi **0** (it had already published, ~0.3 s after the tick, before the signal landed; same in all three runs). The gap is found by the harness afterwards; nothing logs it live yet (see the silent-venue alert in Stage 1.5) |
+| Kill each recorder mid-fetch (tick + 0.2 s), restart | Only the ticks while it was down are missing | Down **0.3–0.4 s** each; gap of **1 tick** (deribit, polymarket, reference); kalshi **0** (it had already published, ~0.3 s after the tick, before the signal landed; same in all three runs). Since 2026-11-12 `ppm monitor` logs each gap live as a `GAP` line (§11), and the harness checks those lines against its own count |
 | Stop Redis for 5 min | Recorders spool to disk and replay; 0 lost | **170 envelopes / 1.16 MB** spooled; replayed at the next tick: spool empty **1.0 s** after that tick, queue drained 2.5 s after it (51 s after Redis came back, which was 10 s past a tick) |
 | Cut the internet for 5 min | Every tick still leaves rows with a cause; recording resumes on its own | **5 error ticks** per venue with the cause stored, **0 silent gaps**; every venue OK again on the first tick after reconnecting (~50.3 s later, i.e. bounded by the 60 s tick) |
 | Whole run | 0 lost, 0 duplicated; census agrees both ways | **759 sent, 759 delivered, 759 stored: 0 lost, 0 duplicated, 0 dropped**, 3 allowed gaps (the recorder kills), 0 unexpected or unlogged. 0 extra stream deliveries (no crash landed mid spool-replay, so that duplicate path is covered by unit tests only) |
+| Monitor (`ppm monitor`, added 2026-11-12, run `run-20261112T185848Z`) | GAP lines equal the harness's gaps; every ALERT explained by a fault | **6/6** gap ticks matched (0 missed, 0 invented), gaps logged **60.5–60.9 s** after the missing tick (one tick: the earliest possible); **6 alerts**, all explained, no false `silent` after the Redis outage |
+| Stop kalshi cleanly for 200 s (`recorder-stop`) | ALERT silent (not before 2.5 ticks), RECOVERED, GAP | ALERT **151.2 s** after its last tick (141.2 s after the stop); RECOVERED + `GAP ticks=3` **30.4 s** after the restart (its first tick) |
+| Monitor during the Redis outage / internet cut | ALERT + RECOVERED of the right kind | Redis `unreachable` ALERT **64.6 s** into the outage (60 s threshold + ≤ 10 s backoff); `failing` ALERT for all 4 venues **231.5 s** after the cut (3 closed error ticks), RECOVERED on the first good tick |
 | Slow writer | Lag alert fires; 0 lost after catch-up | Not built yet (backpressure item) |
 
 Recovery after Redis or network outages is bounded by the tick: recorders only publish (and so replay the spool) and fetch on a tick. A 2 GiB spool at the measured ~0.24 MB/min for four venues lasts roughly 6 days of Redis downtime.
@@ -208,3 +211,26 @@ APIs were re-checked live on 2026-11-11 before building.
 - Kalshi's `status=settled` filter returns markets whose status is `finalized`. Markets closed but not yet settled are skipped and picked up by a later run.
 - Binance returns the next existing candle if the requested minute has none, so the parser checks the candle's open time and quarantines a mismatch.
 - The recorder base gained `tick_ms` (hourly here) and `run_on_start`. Settlements also allow a wake-up up to an hour late, since their rows carry their own timestamps and can't be mislabelled.
+
+## 11. Monitoring: the venue monitor (built 2026-11-12)
+
+**Problem.** The failure test showed that a recorder dead for 0.3 s leaves a 1-tick hole that only `ppm faulttest` finds afterwards. Overnight on the laptop a venue could be dead or failing for hours unnoticed. Done = one alert when a venue goes silent or only fails, one when it recovers, and a log line for every missing tick as soon as it can be detected.
+
+```text
+recorders --XADD--> Redis ppm:{venue} --XREADGROUP--> writer      (unchanged)
+                          \--XREAD (read-only peek)--> ppm monitor
+                                   VenueWatch (pure state machine, one per venue)
+                                   └─> events --> Notifier: LogNotifier [+ NtfyNotifier]
+```
+
+- **Separate process, plain `XREAD`.** A dead process can't report its own death, and inside the writer, writer lag would look like every venue going silent. `XREAD` (unlike `XREADGROUP`) doesn't touch the writer's consumer group: no pending entries, no acks (tested against `XINFO GROUPS`). At start-up it seeds each venue from the newest message (`XREVRANGE … COUNT 1`), so a gap that spans a monitor restart is still found.
+- **Conditions** (`python/ppm/monitor/watch.py`, pure and unit-tested):
+  - **GAP**: tick T followed by T + k·tick (k > 1) → ticks T+tick … T+(k−1)·tick are missing. Older or repeated ticks never make a gap (several messages per tick, spool replay, settlements re-collecting the current hour on restart).
+  - **silent**: no message for 2.5 ticks after the last tick (150 s for minute venues, 2.5 h for settlements). Edge-triggered: one ALERT, then one RECOVERED on the next message.
+  - **failing**: 3 ticks in a row whose messages are all errors. A failed fetch still publishes an error envelope, so an internet cut never looks silent; this is what catches it. A tick is judged when a newer tick arrives or one tick length after it started.
+  - **redis unreachable**: the monitor can't read for ≥ 60 s → one ALERT, RECOVERED on reconnect. After any Redis failure, silence is not judged for one tick + 30 s, because recorders replay their spool only at their next tick (otherwise every venue would raise a false `silent`).
+- **Channels** (`notify.py`): every event is a log line (`GAP` WARNING, `ALERT` ERROR, `RECOVERED` WARNING) in key=value form, e.g. `GAP venue=deribit first=2026-11-12T17:27:00Z last=2026-11-12T17:27:00Z ticks=1 detected_after_s=61.2`. ALERT and RECOVERED also go to an ntfy.sh phone push when `PPM_NTFY_TOPIC` is set (the topic acts as a password, so it is never committed). A failed push is logged, never raised. The `Notifier` interface lets Prometheus Alertmanager replace ntfy later.
+- **Gaps are log lines only.** `fetch_log` stays the coverage source of truth; a second table could disagree and would be a data-contract change.
+- **Thresholds** come from each recorder's `tick_ms`; overrides `PPM_MONITOR_SILENT_TICKS`, `PPM_MONITOR_FAILING_TICKS`.
+
+**Failure tests** (in `ppm faulttest`, monitor added to the `ppmtest` stack): run-wide, the monitor's GAP lines must equal the harness's gaps exactly and every ALERT must be explained by an injected fault; new `recorder-stop` (stop kalshi 200 s) must give ALERT silent → RECOVERED → GAP; net-cut must give ALERT/RECOVERED `failing` per venue (no `silent`); redis-outage must give ALERT/RECOVERED `unreachable` and no false GAP after the spool replay. Measured numbers: see §7.

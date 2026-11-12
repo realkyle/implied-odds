@@ -46,6 +46,7 @@ flowchart LR
 | Redis unreachable | Recorders spool to disk (bounded) and replay in order |
 | A venue's API changes | Only that venue's process is affected; bad rows are quarantined with a reason |
 | Past data edited or deleted | Hash-chain verification fails loudly |
+| A venue goes silent or only returns errors | `ppm monitor` alerts once (log + optional phone push), once on recovery, and logs every missing tick live |
 
 Design decisions and trade-offs: [`docs/design/recorder-pipeline.md`](docs/design/recorder-pipeline.md).
 
