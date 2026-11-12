@@ -123,7 +123,9 @@ def _text(value: bytes | str) -> str:
 
 def _compress(body: bytes) -> tuple[bytes, str]:
     if body:
-        return gzip.compress(body, compresslevel=6), "gzip"
+        # mtime=0: by default gzip writes the current second into its header, so the
+        # same body compressed twice could give different bytes (and a flaky merge).
+        return gzip.compress(body, compresslevel=6, mtime=0), "gzip"
     return body, "identity"
 
 
