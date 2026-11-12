@@ -3,7 +3,21 @@
     "deny": [
       "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
       "Bash(cat .env*)", "Bash(head .env*)", "Bash(tail .env*)",
-      "Bash(less .env*)", "Bash(grep * .env*)", "Bash(source .env*)"
+      "Bash(less .env*)", "Bash(grep * .env*)", "Bash(source .env*)",
+      "Edit(./data/**)", "Write(./data/**)", "Edit(./spool/**)", "Write(./spool/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_data.py\""
+          }
+        ]
+      }
     ]
   }
 }
