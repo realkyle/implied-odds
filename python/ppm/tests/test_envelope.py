@@ -36,6 +36,18 @@ def test_files_written_before_the_change_still_decode(make):
     assert gzip.decompress(env.encode().split(b"\n", 1)[1]) == env.body
 
 
+def test_compression_does_not_depend_on_the_wall_clock(make, monkeypatch):
+    """gzip writes a timestamp into its header unless mtime is fixed; the same message
+    encoded in two different seconds must still give identical bytes (merge determinism)."""
+    import time
+
+    env = make(b'{"price":"0.42"}' * 100)
+    monkeypatch.setattr(time, "time", lambda: 1_000_000_000.0)
+    first = (env.encode(), env.to_fields())
+    monkeypatch.setattr(time, "time", lambda: 2_000_000_000.0)
+    assert (env.encode(), env.to_fields()) == first
+
+
 @pytest.mark.parametrize("body", [b"", b"line1\nline2", b"y" * BIG])
 def test_blob_round_trip(make, body):
     env = make(body)
