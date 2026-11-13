@@ -53,7 +53,8 @@ Design decisions and trade-offs: [`docs/design/recorder-pipeline.md`](docs/desig
 ## Stack
 
 Python 3.11 (asyncio, httpx, redis-py, pyarrow) · C++20 with pybind11 (CMake, GoogleTest, Google Benchmark) ·
-Redis Streams · Parquet · Docker multi-stage + Compose · GitHub Actions CI (Ubuntu, macOS, Docker build) · uv · ruff
+Redis Streams · Parquet · Docker multi-stage + Compose · Terraform (AWS Lightsail VM + S3 backup bucket; [design](docs/design/cloud-vm.md)) ·
+GitHub Actions CI (Ubuntu, macOS, Docker build) · uv · ruff
 
 ## Run it
 

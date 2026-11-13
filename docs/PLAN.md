@@ -195,7 +195,11 @@ Done when: 48 hours of clean, aligned snapshots on disk.
 *Stage 2: streaming and cloud*
 - [ ] Websockets for Deribit and Polymarket: reconnect with exponential backoff + jitter, resubscribe, sequence-gap detection, REST backfill
 - [ ] Kalshi websocket + live CF Benchmarks index (only if an API key is created)
-- [ ] Terraform for one small cloud VM; move recording off the laptop; record monthly cost
+- Terraform for one small cloud VM; move recording off the laptop; record monthly cost (split 2026-11-13; design in `docs/design/cloud-vm.md`):
+  - [x] 2a Terraform base: Lightsail VM + static IP + firewall (SSH from the owner's /32 only), versioned private S3 bucket, IAM user that can write `vm/` but never delete (clean plan after apply; IAM simulation: deletes explicitly denied; anonymous GET 403)
+  - [ ] 2b Deploy the Compose stack (incl. monitor) on the VM; `ppm faulttest` passes there
+  - [ ] 2c Nightly S3 backup + chain head off-machine; tamper test (truncated manifest fails `verify --expect-head <S3 head>`) and restore test
+  - [ ] 2d 24 h laptop + VM parallel run: per-venue coverage, VM becomes canonical, monthly cost recorded
 - [ ] Measure uptime and gap rate over the first multi-week run
 
 ### Phase 1 — C++ foundations (weeks 1–3)

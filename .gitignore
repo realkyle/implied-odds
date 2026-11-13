@@ -21,6 +21,16 @@ data/
 .env.*
 !.env.example
 
+# Terraform: state can hold sensitive values and is local-only; tfvars holds the owner's IP.
+# The lock file (.terraform.lock.hcl) IS committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+crash.log
+
 # Personal working files (kept local for now)
 CLAUDE.md
 CLAUDE.md.bak
