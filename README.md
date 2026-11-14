@@ -61,6 +61,8 @@ GitHub Actions CI (Ubuntu, macOS, Docker build) · uv · ruff
 ```bash
 uv sync && uv run pytest          # tests (builds the C++ extension too)
 docker compose up -d --build      # Redis + writer + all recorders + daily merger, auto-restarting
+uv run ppm faulttest              # kill/outage tests on an isolated copy of the stack
+scripts/vm.sh deploy              # run origin/main on the cloud VM (status, logs, faulttest too)
 uv run ppm verify                 # check the dataset's hash chain
 ```
 

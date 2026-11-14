@@ -1,7 +1,8 @@
 # Cloud VM and off-machine backup (Phase 0, Stage 2)
 
 Status: **2a built and tested 2026-11-13** (Terraform base: VM, firewall, S3 bucket, IAM user).
-2b–2d (deploy, nightly backup, 24 h parallel run) are designed below but not built yet.
+**2b deployed and tested 2026-11-14** (Compose stack running on the VM; `ppm faulttest` passes
+there; see §8). 2c–2d (nightly backup, 24 h parallel run) are designed but not built yet.
 
 ## 1. Problem and "done"
 
@@ -17,7 +18,7 @@ never delete; coverage on the VM is measured against the laptop before the lapto
 | Step | What | Proven by |
 |---|---|---|
 | **2a** | Terraform: VM, static IP, firewall, S3 bucket, scoped IAM user | clean `plan` after `apply`, on-VM checks, IAM policy simulation, anonymous access refused |
-| 2b | Deploy the Compose stack (incl. monitor) on the VM | `ppm faulttest` passes on the VM |
+| **2b** | Deploy the Compose stack (incl. monitor) on the VM | `ppm faulttest` passes on the VM, next to the live stack |
 | 2c | Nightly S3 sync + head recorded off-machine | truncate manifest → `ppm verify --expect-head <S3 head>` fails; restore from S3 → `verify` passes |
 | 2d | 24 h laptop + VM in parallel | per-venue coverage numbers; VM becomes canonical; monthly cost recorded |
 
@@ -112,3 +113,113 @@ together.
 - **Local Terraform state:** if the laptop is lost, the resources keep running but must be
   re-imported (`terraform import`). Acceptable for one owner; remote state in S3 is the upgrade.
 - **Long-lived backup key:** rotate by hand (create a new key, swap it on the VM, delete the old one).
+
+## 8. Stage 2b: deploying the stack (2026-11-14)
+
+### How code and settings reach the VM
+
+```mermaid
+flowchart LR
+  subgraph Laptop
+    S["scripts/vm.sh deploy [--branch] REF"]
+    G["git: REF reachable from origin/main?<br/>(--branch: pushed to GitHub?)"]
+  end
+  S --> G -- "ssh: prelude + quoted script, SHA as $1" --> V
+  subgraph VM["ppm-vm"]
+    V["/srv/ppm/app: git fetch, checkout --detach SHA"]
+    C["live(): COMPOSE_PROJECT_NAME=ppm<br/>PPM_HOST_DATA, PPM_HOST_SPOOL = /srv/ppm/…<br/>docker compose up -d --build --wait"]
+    L[("/srv/ppm/deploys.log<br/>time, SHA, build seconds")]
+  end
+  V --> C --> L
+  GH[(GitHub, public)] -. https clone/fetch .-> V
+```
+
+`scripts/vm.sh` is the only place the VM's settings live. Every VM-side script starts with a
+shared prelude defining `live()`, so the project name and data paths can't be forgotten.
+If `PPM_HOST_DATA` were missing, Compose would silently write into the checkout. If the
+project name defaulted, it would come from the directory name and rename the Redis volume.
+Script bodies are quoted heredocs (nothing expands on the laptop), and arguments must be
+plain tokens, because SSH re-splits them on the VM.
+
+| Command | Does |
+|---|---|
+| `bootstrap` | idempotent: `g++` (apt), uv 0.13.7 (pinned official installer), https clone to `/srv/ppm/app` |
+| `deploy [--branch] [REF]` | refuses a SHA not on `origin/main` (or, with `--branch`, not pushed); checkout `--detach`; `up -d --build --wait`; appends to `deploys.log` |
+| `status` | deployed SHA, services, `free -m`, disk, Redis memory + per-stream length/bytes, last monitor alerts |
+| `logs SERVICE [ARGS]` | `docker compose logs` for the live project |
+| `faulttest [ARGS]` | refuses 01:25–03:30 UTC (daily merge at 02:07); `uv sync --no-dev`, then `uv run --no-sync ppm faulttest` detached under `nohup`, with RAM/swap sampled every 10 s and per-container memory every 60 s |
+
+`ppm faulttest` runs on the VM's **host**, not in a container. It drives the `docker` CLI
+and reads the run's Parquet, exactly as on the laptop. It uses a uv-managed Python 3.11,
+the same version as the image, which ships the headers `ppm_core` needs (Ubuntu's Python
+3.12 has none). The rejected alternative was a harness container with `docker.sock`
+mounted: that is root-equivalent, and the repo would have to be mounted at an identical
+path, because Compose resolves bind mounts on the host.
+
+### Redis memory: retention by time, not by count
+
+The streams kept the last 20,000 messages each. Message sizes differ by venue (deribit
+16 KB, kalshi 17 KB, settlements 33 KB, polymarket 5.5 KB), so at steady state Redis would
+hold about 1.4 GB, which doesn't fit in 1.9 GB of RAM alongside eight Python services. The
+cap is also the writer-downtime tolerance, because Redis trims unacknowledged entries too.
+Under the count cap that tolerance ranged from 21 h (polymarket) to 16 days (settlements).
+
+Now each publish runs `XADD`, then `XTRIM MINID <arrival ms − 12 h>`. A stream ID is
+`<ms>-<seq>` stamped by Redis, so this keeps exactly the last 12 h on every stream (about
+205 MB). The cutoff comes from the ID Redis just returned, not the recorder's clock, so
+clock skew between the two can't trim new messages. Docker Desktop's VM clock drifts after
+the Mac sleeps. Trimming is exact (not `~`), and a failed trim doesn't re-spool an
+already-stored message. Setting: `PPM_STREAM_RETAIN_H`, passed into every ppm container
+by `docker-compose.yml`. Rejected: a VM-only cap of 4000
+(about 290 MB, but only about 4 h of tolerance for polymarket); resizing to 4 GB ($24/month,
+forces a replacement).
+
+### Results (2026-11-14, deploy `867e4a8`)
+
+| Check | Result |
+|---|---|
+| bootstrap | 22 s; second run changes nothing |
+| first deploy (image build incl. C++ + start) | 94 s; 9/9 services up |
+| `ppm faulttest` next to the live stack | writer-kill, recorder-kill, recorder-stop, redis-outage, net-cut, monitor, integrity **all PASS**; sent 811 = delivered 811 = stored 811, 0 lost, 0 duplicated |
+| live stack during the test | 0 monitor ALERT/GAP lines, 0 writer errors, 0 container restarts |
+| memory, whole VM | before the test 983 MB used; **peak 1234 MB used + 286 MB swap** (of 1905 MB + 2 GB swap); live containers peaked at 428 MiB total |
+| reboot (`systemctl reboot`) | all 9 services running again after **28 s**, via `restart: unless-stopped`; 0 ticks missed (reboot at :16 s, back before the next tick) |
+| refusals | unmerged SHA, unpushed SHA with `--branch`, faulttest at 02:07 UTC, argument with shell characters: all exit 1, nothing run |
+
+The VM numbers match the laptop's (silent ALERT 150.9 s after the last tick vs 151.2 s;
+Redis ALERT 64.3 s vs 64.6 s; `failing` ALERT 231.4 s vs 231.5 s).
+
+### What went wrong
+
+- **`MAXLEN`'s byte cost was invisible until measured.** The cap was chosen as "about 2 days
+  of deribit". Per-stream `MEMORY USAGE` on the laptop showed settlements at 33 KB per
+  message heading for 660 MB on its own.
+- **Approximate trimming never trimmed in tests.** `MINID ~` only drops whole internal
+  nodes (about 100 entries), so a small test stream stayed untouched. Exact trimming costs
+  nothing at about 30 messages a minute, and tests now exercise what production runs.
+- **First draft trimmed by the recorder's clock.** Caught before deploying: on the laptop,
+  Redis runs in Docker Desktop's VM, whose clock can lag. A cutoff ahead of Redis would trim
+  brand-new messages. Fixed by measuring from the returned ID.
+- **`nohup cmd | tee` doesn't survive a dropped SSH session.** `tee` dies with the session
+  and the test then gets a broken pipe. Now the test writes to a file, the session only
+  `tail --pid`s it, and the samplers run only while the test's PID is alive.
+- **`uv run` re-synced the dev group** (pytest, ruff, fakeredis) right after
+  `uv sync --no-dev`. Harmless, but not what the script claimed. Fixed with `uv run --no-sync`
+  (after the measured run; same code under test).
+- **Diff review found `status` silently stopping halfway.** `bash -s` reads its script
+  from stdin, and `docker compose exec` (even with `-T`) read the rest of it, so the monitor
+  section never ran, yet the command still exited 0. Every stdin-reading VM command now gets
+  `</dev/null`. The same review found that `PPM_STREAM_RETAIN_H` never reached the
+  containers (now passed by Compose), and that `deploy --branch` trusted stale
+  remote-tracking refs (now `fetch --prune`).
+
+### Open risks after 2b
+
+- **A dead writer isn't alerted, and the loss would be silent.** `ppm monitor` watches
+  venue streams, not the writer. After 12 h, messages the writer never received are trimmed
+  with no `DATA LOSS` line (that line covers only delivered-but-unacked ones). A writer-lag
+  alert is designed (`recorder-pipeline.md` §5) but not built. It should exist before the
+  VM becomes canonical (2d).
+- **Memory headroom is about 650 MB** with both stacks plus some swap. The daily merge (peak
+  396 MB on 16 h of data in testing; a full day is bigger) must not overlap a fault test,
+  hence the 01:25–03:30 refusal. Check the merge's real peak on the VM in 2d.

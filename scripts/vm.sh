@@ -45,6 +45,8 @@ VM
 )
 
 # run_vm ARGS... <<'VM' body VM: run prelude + body (stdin) on the VM with ARGS as $1...
+# `bash -s` reads the script itself from stdin, so any VM command that could read stdin
+# (docker compose exec, apt, git) gets </dev/null, or it would swallow the rest.
 # Bodies are quoted heredocs, so nothing in them is expanded on the laptop. SSH joins the
 # arguments with spaces and the VM's shell splits them again, so only plain tokens are
 # allowed (checked here), never anything with spaces or shell characters.
@@ -61,14 +63,15 @@ cmd_bootstrap() {
 repo_url=$1 uv_version=$2
 # g++ builds ppm_core for the host-side faulttest venv (cmake/ninja come from PyPI).
 if ! command -v g++ >/dev/null; then
-  sudo apt-get -o DPkg::Lock::Timeout=600 update -q
-  sudo apt-get -o DPkg::Lock::Timeout=600 install -y -q --no-install-recommends g++
+  sudo apt-get -o DPkg::Lock::Timeout=600 update -q </dev/null
+  sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 \
+    install -y -q --no-install-recommends g++ </dev/null
 fi
 if [ "$(uv --version 2>/dev/null | cut -d' ' -f2)" != "$uv_version" ]; then
   # Official installer, pinned to one version; installs to ~/.local/bin only.
   curl -LsSf "https://astral.sh/uv/$uv_version/install.sh" | UV_NO_MODIFY_PATH=1 sh
 fi
-[ -d "$APP/.git" ] || git clone --quiet "$repo_url" "$APP"
+[ -d "$APP/.git" ] || git clone --quiet "$repo_url" "$APP" </dev/null
 echo "g++ $(g++ -dumpversion), $(uv --version), checkout $(git -C "$APP" rev-parse --short HEAD)"
 VM
 }
@@ -80,7 +83,8 @@ cmd_deploy() {
     shift
   fi
   local ref=${1:-origin/main} sha
-  git -C "$ROOT" fetch --quiet origin
+  # --prune: a branch deleted on GitHub (after a squash-merge) must not still count as pushed.
+  git -C "$ROOT" fetch --quiet --prune origin
   sha=$(git -C "$ROOT" rev-parse --verify --quiet "$ref^{commit}") || die "unknown ref: $ref"
   if git -C "$ROOT" merge-base --is-ancestor "$sha" origin/main; then
     :
@@ -94,7 +98,7 @@ cmd_deploy() {
   run_vm "$sha" <<'VM'
 sha=$1
 cd "$APP"
-git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
 git checkout --quiet --detach "$sha"
 start=$(date +%s)
 live up -d --build --wait --remove-orphans
@@ -116,7 +120,7 @@ live exec -T redis sh -c '
   redis-cli INFO memory | grep -E "^used_memory_human|^used_memory_peak_human"
   for s in $(redis-cli --scan --pattern "ppm:*"); do
     echo "$s len=$(redis-cli XLEN "$s") bytes=$(redis-cli MEMORY USAGE "$s" SAMPLES 0)"
-  done'
+  done' </dev/null
 echo "--- monitor (last 5 alert/gap lines)"
 live logs --no-color --no-log-prefix monitor | grep -E "ALERT|GAP|RECOVERED" | tail -n5 || true
 VM
@@ -144,24 +148,26 @@ cd "$APP"
 # (Ubuntu's system Python 3.12 has none).
 export UV_PYTHON=3.11 UV_PYTHON_PREFERENCE=only-managed
 uv sync --quiet --no-dev --frozen
+# --no-sync below: `uv run` would otherwise re-sync and add the dev group back.
 out=.faulttest/vm-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$out"
 # Detached (nohup, output to a file): if this SSH session drops, the test carries on and
 # its log stays in $out/faulttest.log; this session only follows it.
-nohup uv run ppm faulttest "$@" >"$out/faulttest.log" 2>&1 </dev/null &
+nohup uv run --no-sync ppm faulttest "$@" >"$out/faulttest.log" 2>&1 </dev/null &
 test_pid=$!
 # Memory samplers, alive exactly as long as the test: whole-VM RAM and swap in use every
 # 10 s, per container every 60 s.
 (while kill -0 "$test_pid" 2>/dev/null; do
   free -m | awk -v t="$(date -u +%T)" '/^Mem:/{m=$3} /^Swap:/{s=$3} END{print t, m, s}'
   sleep 10
-done >"$out/memory.tsv") &
+done >"$out/memory.tsv" 2>/dev/null) &
 (while kill -0 "$test_pid" 2>/dev/null; do
   date -u +%T
   docker stats --no-stream --format '{{.Name}} {{.MemUsage}}'
   sleep 60
-done >"$out/docker-stats.log") &
-tail -n +1 -f --pid="$test_pid" "$out/faulttest.log"
+done >"$out/docker-stats.log" 2>/dev/null) &
+# Samplers write only to files (stdout and stderr), so SSH doesn't wait for them to exit.
+tail -n +1 -f --pid="$test_pid" "$out/faulttest.log" || true # a dropped session ends only tail
 code=0
 wait "$test_pid" || code=$?
 awk 'BEGIN{m=0; s=0} {if ($2 > m) m = $2; if ($3 > s) s = $3}

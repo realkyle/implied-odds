@@ -89,9 +89,11 @@ class RedisBus:
 
     Retention: a stream keeps every message from the last `retain_ms`, acknowledged or
     not, and each publish trims anything older. That window is how long the writer can be
-    down before data is lost: a message trimmed before the writer reads it is gone (the
-    consumer logs it as DATA LOSS). Trimming by time rather than by count gives every
-    venue the same window, whatever its message size or rate.
+    down before data is lost. A trimmed message the writer had already been handed but not
+    acked is logged as DATA LOSS by the consumer; one it was never handed vanishes with no
+    log at all, so a writer that is down longer than the window loses data silently.
+    Trimming by time rather than by count gives every venue the same window, whatever its
+    message size or rate.
     """
 
     def __init__(self, redis: Redis, spool: DiskSpool, retain_ms: int) -> None:
