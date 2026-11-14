@@ -74,7 +74,7 @@ async def _record(venue: str, settings: Settings) -> None:
     stop = _stop_event()
     redis = Redis.from_url(settings.redis_url, socket_timeout=5, socket_connect_timeout=5)
     spool = DiskSpool(settings.spool_dir / venue, settings.spool_max_bytes)
-    bus = RedisBus(redis, spool, settings.stream_maxlen)
+    bus = RedisBus(redis, spool, settings.stream_retain_ms)
     headers = {"User-Agent": "ppm-recorder/0.1 (research, read-only)"}
     async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
         await RECORDERS[venue](client, bus).run_forever(stop)

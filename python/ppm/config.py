@@ -16,7 +16,7 @@ class Settings:
     data_dir: Path
     spool_dir: Path
     spool_max_bytes: int
-    stream_maxlen: int
+    stream_retain_ms: int
     # Venue monitor: silent after this many ticks with no message; failing after this
     # many ticks in a row with only error messages. Optional ntfy.sh topic for pushes.
     monitor_silent_ticks: float = 2.5
@@ -32,15 +32,22 @@ class Settings:
             spool_dir=Path(os.environ.get("PPM_SPOOL_DIR", "spool")),
             # 2 GiB of disk spool rides out roughly a day of Redis downtime for all venues.
             spool_max_bytes=int(os.environ.get("PPM_SPOOL_MAX_BYTES", str(2 * 1024**3))),
-            # Per-stream cap. Redis trims the oldest entries past this even if they are
-            # unacknowledged, so it is a last-resort memory guard, not a buffer to rely on.
-            # ~20k Deribit messages is about 2 days of writer downtime.
-            stream_maxlen=int(os.environ.get("PPM_STREAM_MAXLEN", "20000")),
+            # Stream retention window = how long the writer may be down before messages
+            # are trimmed unread (lost). 12 h of every venue is ~205 MB of Redis memory
+            # (measured 2026-11-14), which fits the 2 GB VM; a count cap did not.
+            stream_retain_ms=_hours_to_ms(os.environ.get("PPM_STREAM_RETAIN_H", "12")),
             monitor_silent_ticks=float(os.environ.get("PPM_MONITOR_SILENT_TICKS", "2.5")),
             monitor_failing_ticks=int(os.environ.get("PPM_MONITOR_FAILING_TICKS", "3")),
             ntfy_topic=os.environ.get("PPM_NTFY_TOPIC") or None,
             monitor_venues=_csv(os.environ.get("PPM_MONITOR_VENUES")),
         )
+
+
+def _hours_to_ms(value: str) -> int:
+    hours = float(value)
+    if not hours > 0:  # also rejects NaN
+        raise ValueError(f"PPM_STREAM_RETAIN_H must be a positive number of hours, got {value!r}")
+    return int(hours * 3_600_000)
 
 
 def _csv(value: str | None) -> tuple[str, ...] | None:

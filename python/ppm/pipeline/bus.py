@@ -85,12 +85,21 @@ class DiskSpool:
 
 
 class RedisBus:
-    """Recorder-side publisher with a disk-spool fallback."""
+    """Recorder-side publisher with a disk-spool fallback.
 
-    def __init__(self, redis: Redis, spool: DiskSpool, stream_maxlen: int) -> None:
+    Retention: a stream keeps every message from the last `retain_ms`, acknowledged or
+    not, and each publish trims anything older. That window is how long the writer can be
+    down before data is lost: a message trimmed before the writer reads it is gone (the
+    consumer logs it as DATA LOSS). Trimming by time rather than by count gives every
+    venue the same window, whatever its message size or rate.
+    """
+
+    def __init__(self, redis: Redis, spool: DiskSpool, retain_ms: int) -> None:
+        if retain_ms <= 0:
+            raise ValueError(f"retain_ms must be positive, got {retain_ms}")
         self._redis = redis
         self._spool = spool
-        self._maxlen = stream_maxlen
+        self._retain_ms = retain_ms
 
     async def publish(self, env: Envelope) -> PublishResult:
         try:
@@ -118,13 +127,22 @@ class RedisBus:
             self._spool.remove(path)
 
     async def _xadd(self, env: Envelope) -> None:
-        # approximate=True ("MAXLEN ~") lets Redis trim in efficient whole blocks.
-        await self._redis.xadd(
-            stream_name(env.venue),
-            env.to_fields(),  # type: ignore[arg-type]
-            maxlen=self._maxlen,
-            approximate=True,
-        )
+        stream = stream_name(env.venue)
+        message_id = await self._redis.xadd(stream, env.to_fields())  # type: ignore[arg-type]
+        # A stream ID is "<ms since epoch>-<seq>", stamped by Redis's clock on arrival.
+        # The cutoff is measured from the ID Redis just gave us, not from this process's
+        # clock: if the two clocks disagreed (Docker Desktop's VM drifts after the Mac
+        # sleeps), a cutoff ahead of Redis could trim brand-new messages. A spooled
+        # envelope replayed after an outage also gets a fresh ID, so it is kept.
+        # Exact trimming, not "~": "~" only drops whole internal blocks of ~100 entries;
+        # cheaper, but pointless at ~30 messages a minute, and harder to test.
+        # Not atomic with the XADD, on purpose: the message is already stored, so a failed
+        # trim must not make publish() spool it again; the next publish trims instead.
+        arrived_ms = int(_text(message_id).split("-", 1)[0])
+        try:
+            await self._redis.xtrim(stream, minid=arrived_ms - self._retain_ms, approximate=False)
+        except _REDIS_DOWN as exc:
+            log.warning("trim of %s skipped (%s); the next publish retries", stream, exc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +209,7 @@ class StreamConsumer:
         deliveries: list[Delivery] = []
         for stream, messages in response or []:
             for message_id, fields in messages:
-                if not fields:  # pending entry whose data was trimmed by MAXLEN
+                if not fields:  # pending, but older than the retention window: trimmed
                     log.error("DATA LOSS: pending message %s on %s was trimmed", message_id, stream)
                     await self._redis.xack(stream, self._group, message_id)
                     continue
