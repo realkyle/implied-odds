@@ -43,10 +43,11 @@ BACKUP_KEY=/srv/ppm/secrets/aws-backup
 export PATH="$HOME/.local/bin:$PATH"
 live() {
   cd "$APP"
-  # The backup service runs only once its key is installed (`vm.sh backup-key`), so a
-  # deploy before that still works; the bucket name is written by `vm.sh deploy`.
+  # The backup service runs only once both its key (`vm.sh backup-key`) and the bucket
+  # name (written by `vm.sh deploy`) exist. Otherwise it would exit at start and
+  # crash-loop under `restart: unless-stopped` without ever reaching its alerting.
   local profiles=""
-  [ -f "$BACKUP_KEY" ] && profiles=backup
+  [ -f "$BACKUP_KEY" ] && [ -s /srv/ppm/backup-bucket ] && profiles=backup
   COMPOSE_PROJECT_NAME=ppm PPM_HOST_DATA=/srv/ppm/data PPM_HOST_SPOOL=/srv/ppm/spool \
     COMPOSE_PROFILES=$profiles PPM_BACKUP_CREDENTIALS=$BACKUP_KEY \
     PPM_BACKUP_BUCKET=$(cat /srv/ppm/backup-bucket 2>/dev/null || true) \

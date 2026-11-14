@@ -83,5 +83,13 @@ def check_permissions(client: Any, bucket: str, prefix: str = "vm/") -> list[Pro
                 )
             ),
         ),
+        # The job HEADs each new key before uploading it. S3 answers 404 for a missing key
+        # only if the caller may list the bucket, otherwise 403, and a 403 here would fail
+        # every pass. (Verified 404 on 2026-11-14, after a review questioned it.)
+        Probe(
+            "HEAD a missing key (must be 404, not 403)",
+            404,
+            _status(lambda: client.head_object(Bucket=bucket, Key=f"{prefix}probe/{stamp}-none")),
+        ),
     ]
     return probes

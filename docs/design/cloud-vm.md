@@ -2,7 +2,9 @@
 
 Status: **2a built and tested 2026-11-13** (Terraform base: VM, firewall, S3 bucket, IAM user).
 **2b deployed and tested 2026-11-14** (Compose stack running on the VM; `ppm faulttest` passes
-there; see §8). 2c–2d (nightly backup, 24 h parallel run) are designed but not built yet.
+there; see §8). **2c1 deployed 2026-11-14** (write-once S3 backup service; the permission
+check passes against real S3; the first data upload waits for the VM's first merge; see §9).
+2c2 and 2d are not built yet.
 
 ## 1. Problem and "done"
 
@@ -19,7 +21,8 @@ never delete; coverage on the VM is measured against the laptop before the lapto
 |---|---|---|
 | **2a** | Terraform: VM, static IP, firewall, S3 bucket, scoped IAM user | clean `plan` after `apply`, on-VM checks, IAM policy simulation, anonymous access refused |
 | **2b** | Deploy the Compose stack (incl. monitor) on the VM | `ppm faulttest` passes on the VM, next to the live stack |
-| 2c | Nightly S3 sync + head recorded off-machine | truncate manifest → `ppm verify --expect-head <S3 head>` fails; restore from S3 → `verify` passes |
+| **2c1** | Write-once S3 backup service + bucket policy | unit tests; VM-key probes: overwrite → 412; unconditional PUT, If-Match, DELETE, write outside `vm/` → 403 |
+| 2c2 | Restore + tamper tests (owner's SSO session) | truncate manifest → `ppm verify --expect-head <S3 head>` fails; restore from S3 → `verify` passes; 1 version per key |
 | 2d | 24 h laptop + VM in parallel | per-venue coverage numbers; VM becomes canonical; monthly cost recorded |
 
 ## 2. Architecture
@@ -223,3 +226,132 @@ Redis ALERT 64.3 s vs 64.6 s; `failing` ALERT 231.4 s vs 231.5 s).
 - **Memory headroom is about 650 MB** with both stacks plus some swap. The daily merge (peak
   396 MB on 16 h of data in testing; a full day is bigger) must not overlap a fault test,
   hence the 01:25–03:30 refusal. Check the merge's real peak on the VM in 2d.
+
+## 9. Stage 2c1: write-once S3 backup (2026-11-14)
+
+**Problem.** The data and its chain head sat on one disk. A truncated `manifest.jsonl`
+is still a valid chain, so `ppm verify` passes unless it's given a head recorded
+somewhere the VM can't rewrite.
+
+**Done (2c1):** a service on the VM copies every merged file, the manifest and the head
+to S3. The VM's key can create objects under `vm/` but never replace or delete one,
+proven against real S3. In 2c2, the owner's SSO session restores from S3 and runs the
+tamper test.
+
+### Design (decided 2026-11-14)
+
+```mermaid
+flowchart LR
+  M["merger (:07)<br/>tables/ archive/<br/>manifest.jsonl"] --> D[("/srv/ppm/data<br/>(mounted read-only)")]
+  D --> B["backup (at start, then :37)<br/>ppm backup --loop"]
+  K["/srv/ppm/secrets/aws-backup<br/>0400 uid 1000<br/>(Compose secret)"] --> B
+  B -- "PUT If-None-Match: *<br/>files → manifest → head" --> S3[("s3://ppm-backup-…/vm/<br/>write-once")]
+  O["owner SSO (2c2)<br/>ppm restore → ppm verify --expect-head"] --> S3
+```
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Compose service `backup`, catch-up pass at start and hourly at :37, `profiles: [backup]` | Host systemd timer + AWS CLI script; a timer that launches a one-shot container | One deploy path, with the same restart and logging as the merger. The logic is Python and unit-tested. A late merge or an outage is caught up on the next pass instead of the next night |
+| Key piped from `aws iam create-access-key` into `vm.sh backup-key` | Paste it over SSH; SSM Parameter Store | The secret only travels through pipes. SSM would need a credential to fetch the credential |
+| **Write-once keys**, enforced by the bucket policy: `s3:if-none-match` must be present and `s3:if-match` absent | Overwrite + versioning with a "first version wins" check; the laptop records heads; S3 Object Lock | The VM *cannot* overwrite, so every key has exactly one version. Object Lock only prevents deleting versions, which the deny-delete policy already does |
+
+**S3 layout** (every key is created once):
+
+```
+vm/<entry.path>               each merged file (tables/…/part-N.parquet, archive/…/raw-N.tar)
+vm/manifest/000025.jsonl      the manifest when its last entry had seq 25
+vm/heads/000025.json          {"head": <chain>, "manifest_sha256": …, "seq": 25}
+vm/probe/<timestamp>.txt      left by `ppm backup --check-permissions`
+```
+
+**One pass** (`python/ppm/backup/job.py`):
+1. Snapshot the manifest (complete lines only) and check its chain.
+2. The local chain must **extend** the newest stored head, meaning the same chain value at
+   that seq. If it doesn't, the pass stops with `fork`.
+3. Re-hash each new entry's file against the manifest, then upload it. A HEAD request
+   comes first, so a crashed pass never re-sends a 400 MB tar.
+4. Upload the manifest snapshot, then the head, **last**.
+
+A refused pass (`fork`, `integrity`) or an S3 error logs `ALERT kind=backup` and is
+pushed via ntfy once per distinct problem; `RECOVERED` follows when a pass succeeds again.
+
+**Policy details**
+- CreateMultipartUpload and UploadPart can't carry `If-None-Match`, so the Deny exempts
+  them (`s3:ObjectCreationOperation = false`). The condition is checked on
+  CompleteMultipartUpload, the moment the object appears.
+- The Deny sits in the **bucket** policy, so widening the user's own policy later can't
+  undo it.
+- Side effect: no CopyObject into `vm/`.
+
+### Results (2026-11-14, deploy `4d8a971`)
+
+- `terraform apply`: only the bucket policy changed; the `plan` afterwards is clean.
+- **`vm.sh backup-check`, VM key against real S3: 6/6 PASS.**
+
+  | Request | Expected |
+  |---|---|
+  | create a new key | 200 |
+  | re-create it | 412 |
+  | PUT without `If-None-Match` | 403 |
+  | `If-Match` overwrite | 403 |
+  | DELETE | 403 |
+  | write outside `vm/` | 403 |
+
+- Key installed: `aws-backup` is mode 400, uid 1000, 116 bytes; its directory is 0700. The
+  failure path (bad JSON piped in) wrote nothing and exited 1.
+- Deploy: 81 s build+start, **0 ticks missed** (every venue present every minute
+  03:06–03:10). That was timing luck, not design; 2e is still needed.
+- Idle RAM of `backup`: **105 MiB** (estimate was 60–80). VM memory available after the
+  deploy: 836 MB.
+- Image size: 454 → 510 MB (+56 MB for boto3/botocore; estimate was ~15 MB).
+- **Pending:** the first real upload. The VM's first merge is 2026-11-15 ~02:07 UTC, so
+  the first pass with data is at 02:37. Record its time and bytes, and how long a pass with
+  nothing new takes.
+
+### What went wrong
+
+- **boto3's managed `upload_file` silently drops `IfNoneMatch`.** In s3transfer 0.19.3 it
+  is in neither `ALLOWED_UPLOAD_ARGS` nor the complete-multipart args. Using it would have
+  turned every write-once upload into an unconditional PUT, which the policy denies.
+  - Fix: `put_object` up to 64 MB; above that, our own sequential multipart upload
+    (16 MB parts) with the condition on `complete_multipart_upload`.
+- **The first draft re-sent whole files after a crash** only to get a 412 back. A unit
+  test exposed it; the job now sends a HEAD request first.
+- **"Also once at start" was false for :37.** The comment was copied from the merger's :07
+  loop. After the 03:08 deploy, the first pass would have waited until 03:37.
+  - Fix (after the deploy): the first pass now runs at startup.
+- **The data-protection hook blocked two shell commands,** because their text contained
+  `rm`/`mv` next to `data`. Used the Edit tool and a commit-message file instead, as the
+  project notes say.
+
+### Diff review (subagent, 2026-11-14)
+
+**Disproved by a live test**
+- *"HEAD on a missing key returns 403, so every pass fails."* The claim was that the
+  ListBucket grant's `s3:prefix` condition doesn't apply to HEAD. From the VM's container,
+  HEAD `vm/does-not-exist.txt` returned **404**. It is now a 7th probe in
+  `--check-permissions`, so the claim is re-proven on every check.
+
+**Fixed (each with a unit test)**
+- An emptied or missing manifest, or an empty `/data` mount, after a backup logged
+  "nothing new". It is now a `fork`.
+- After the startup pass, the next :37 was skipped (`next_tick` + offset). Fixed with
+  `next_backup_at`.
+- De-duplication compared the full error text, which includes request IDs, so one S3
+  outage would push every hour. S3/network errors now compare by exception type.
+- With the key installed but the bucket file missing, the service crash-looped with no
+  alert. `live()` now enables the profile only when both files exist.
+
+**Accepted**
+- A 409 `ConditionalRequestConflict` (two writers racing on one key) isn't mapped to
+  "exists". The upload is aborted and retried next pass. There is only one writer.
+
+### Open risks after 2c1
+
+- **A VM that silently stops backing up isn't caught off-machine.** The service alerts on
+  its own failures, but if it stops entirely, only the age of the newest `vm/heads/` key
+  shows it. 2c2's check, or a later laptop-side check, should flag a head older than ~26 h.
+- **Probe objects pile up:** each `backup-check` run leaves ~20 bytes the VM can't delete.
+  Negligible; the owner can delete `vm/probe/` by hand.
+- **Key rotation is manual:** create a second key, run `vm.sh backup-key`, redeploy, then
+  delete the old key.

@@ -33,7 +33,7 @@ from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
 from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
 from ppm.monitor.service import Monitor, build_watches
-from ppm.monitor.watch import BackupFailed, Event, ProbeAlert, Recovered
+from ppm.monitor.watch import BackupFailed, ProbeAlert, Recovered
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
@@ -201,6 +201,22 @@ BACKUP_EVERY_MS = 3_600_000
 BACKUP_OFFSET_MS = 37 * 60_000
 
 
+def next_backup_at(now: int) -> int:
+    """The next :37 strictly after `now`. (`next_tick` + offset would skip one: after a
+    startup pass at 10:20 it gives 11:37, not 10:37.)"""
+    at = floor_tick(now, BACKUP_EVERY_MS) + BACKUP_OFFSET_MS
+    return at if at > now else at + BACKUP_EVERY_MS
+
+
+def _alert_key(alert: BackupFailed) -> tuple[str, str]:
+    """What makes two backup alerts 'the same problem' for de-duplication. S3/network
+    errors compare by exception type only: their text carries request IDs that change
+    every hour, which would otherwise push the same outage hourly."""
+    if alert.reason == "error":
+        return alert.reason, alert.detail.split(":", 1)[0]
+    return alert.reason, alert.detail
+
+
 def _backup_summary(report: BackupReport) -> str:
     if report.head is None:
         return f"nothing new ({report.seconds:.1f} s)"
@@ -242,11 +258,13 @@ async def _backup(settings: Settings, loop: bool, check: bool) -> int:
         stop = _stop_event()
         log.info("backup started: s3://%s/%s", settings.backup_bucket, settings.backup_prefix)
         failing_since: int | None = None
-        last_alert: Event | None = None
-        run_at = floor_tick(now_ms(), BACKUP_EVERY_MS) + BACKUP_OFFSET_MS  # also once at start
+        last_alert: tuple[str, str] | None = None
+        # First pass right away, so every deploy shows at once whether key and bucket
+        # work; then hourly at :37. (The pass is idempotent, so an extra one is harmless.)
+        run_at = now_ms()
         while not stop.is_set():
             if now_ms() >= run_at:
-                alert: Event | None = None
+                alert: BackupFailed | None = None
                 try:
                     # boto3 is blocking; a thread keeps SIGTERM handling responsive. If the
                     # container is killed mid-upload, nothing half-written becomes visible.
@@ -259,13 +277,13 @@ async def _backup(settings: Settings, loop: bool, check: bool) -> int:
                     alert = BackupFailed("error", f"{type(exc).__name__}: {exc}")
                 if alert is not None:
                     failing_since = failing_since or now_ms()
-                    if alert != last_alert:  # one push per distinct problem, not hourly
+                    if _alert_key(alert) != last_alert:  # one push per problem, not hourly
                         await notifier.notify(alert)
-                    last_alert = alert
+                    last_alert = _alert_key(alert)
                 elif failing_since is not None:
                     await notifier.notify(Recovered("s3", "backup", now_ms() - failing_since))
                     failing_since, last_alert = None, None
-                run_at = next_tick(now_ms(), BACKUP_EVERY_MS) + BACKUP_OFFSET_MS
+                run_at = next_backup_at(now_ms())
             await sleep_until(min(run_at, now_ms() + 60_000), stop)
     return 0
 

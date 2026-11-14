@@ -122,10 +122,12 @@ class BackupJob:
         if problems := chain_problems(entries):
             p = problems[0]
             raise BackupRefused("integrity", f"seq={p.seq} {p.message}")
-        if not entries:
-            return report
 
+        # Read the stored head even when the local manifest is empty: a manifest that
+        # vanished (or a wrong/empty data mount) after a backup is a fork, not "nothing new".
         stored = latest_head(self.store, self.prefix)
+        if not entries and stored is None:
+            return report
         if stored is not None:
             self._check_extends(stored, entries)
             if stored.seq == entries[-1].seq:

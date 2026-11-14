@@ -378,11 +378,12 @@ def test_check_permissions_all_refusals_pass(s3):
     stub.add_client_error("put_object", "AccessDenied", http_status_code=403)
     stub.add_client_error("delete_object", "AccessDenied", http_status_code=403)
     stub.add_client_error("put_object", "AccessDenied", http_status_code=403)
+    stub.add_client_error("head_object", "404", http_status_code=404)
     probes = check_permissions(client, "b")
-    assert len(probes) == 6 and all(p.ok for p in probes)
+    assert len(probes) == 7 and all(p.ok for p in probes)
 
 
-def test_check_permissions_flags_an_allowed_overwrite(s3):
+def test_check_permissions_flags_an_allowed_overwrite_and_a_403_head(s3):
     client, stub = s3
     stub.add_response("put_object", _meta(200))
     stub.add_response("head_object", {"ETag": '"e"'})
@@ -391,8 +392,43 @@ def test_check_permissions_flags_an_allowed_overwrite(s3):
     stub.add_client_error("put_object", "AccessDenied", http_status_code=403)
     stub.add_client_error("delete_object", "AccessDenied", http_status_code=403)
     stub.add_client_error("put_object", "AccessDenied", http_status_code=403)
+    stub.add_client_error("head_object", "403", http_status_code=403)  # no list permission
     probes = check_permissions(client, "b")
-    assert [p.ok for p in probes] == [True, True, False, True, True, True]
+    assert [p.ok for p in probes] == [True, True, False, True, True, True, False]
+
+
+# --- review fixes (2026-11-14): empty manifest, schedule, alert de-duplication
+
+
+def test_manifest_gone_after_a_backup_is_a_fork_not_nothing_new(data):
+    store = MemoryStore()
+    BackupJob(data.root, store, P).run_once()
+    data.path.write_bytes(b"")  # deleted/emptied, or an empty dir mounted at /data
+    with pytest.raises(BackupRefused) as exc:
+        BackupJob(data.root, store, P).run_once()
+    assert exc.value.reason == "fork"
+
+
+def test_next_backup_never_skips_the_coming_37():
+    from ppm.cli import next_backup_at
+
+    hour = 3_600_000
+    t0 = 1794618000000  # 2026-11-14 01:00:00 UTC, a whole hour
+    m = 60_000
+    assert next_backup_at(t0 + 20 * m) == t0 + 37 * m  # startup pass at :20 -> same hour
+    assert next_backup_at(t0 + 37 * m) == t0 + hour + 37 * m  # just ran at :37 -> next hour
+    assert next_backup_at(t0 + 50 * m) == t0 + hour + 37 * m
+
+
+def test_alert_key_ignores_changing_error_text_but_not_fork_details():
+    from ppm.cli import _alert_key
+    from ppm.monitor.watch import BackupFailed
+
+    a = BackupFailed("error", "EndpointConnectionError: request id 1")
+    b = BackupFailed("error", "EndpointConnectionError: request id 2")
+    c = BackupFailed("error", "ClientError: AccessDenied")
+    assert _alert_key(a) == _alert_key(b) != _alert_key(c)
+    assert _alert_key(BackupFailed("fork", "seq 3")) != _alert_key(BackupFailed("fork", "seq 4"))
 
 
 def test_check_permissions_stops_if_the_key_cannot_write_at_all(s3):
