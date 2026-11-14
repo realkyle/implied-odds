@@ -9,6 +9,7 @@ description = "Pricing prediction markets with the options market"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3>=1.44.3",
     "httpx>=0.28.1",
     "pyarrow>=26.0.1",
     "redis>=8.1.0",

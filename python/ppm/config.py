@@ -1,6 +1,7 @@
 """Runtime settings, read from environment variables with safe local defaults.
 
-No secrets live here. Stage 1 uses only public venue APIs.
+No secrets live here. Stage 1 uses only public venue APIs. The S3 backup's access key is
+not a setting: boto3 reads it from AWS_SHARED_CREDENTIALS_FILE (a Compose secret on the VM).
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ class Settings:
     monitor_failing_ticks: int = 3
     ntfy_topic: str | None = None
     monitor_venues: tuple[str, ...] | None = None  # None: every recorder
+    # Off-machine backup (S3). The bucket name comes from `terraform output backup_bucket`.
+    backup_bucket: str | None = None
+    backup_prefix: str = "vm/"
+    backup_region: str = "us-east-1"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -40,6 +45,9 @@ class Settings:
             monitor_failing_ticks=int(os.environ.get("PPM_MONITOR_FAILING_TICKS", "3")),
             ntfy_topic=os.environ.get("PPM_NTFY_TOPIC") or None,
             monitor_venues=_csv(os.environ.get("PPM_MONITOR_VENUES")),
+            backup_bucket=os.environ.get("PPM_BACKUP_BUCKET") or None,
+            backup_prefix=os.environ.get("PPM_BACKUP_PREFIX", "vm/"),
+            backup_region=os.environ.get("PPM_BACKUP_REGION", "us-east-1"),
         )
 
 

@@ -76,6 +76,30 @@ class Problem:
     message: str
 
 
+def parse_entries(text: str) -> list[ManifestEntry]:
+    """Entries from manifest text (JSON lines). Raises ValueError/TypeError if malformed."""
+    return [ManifestEntry(**json.loads(line)) for line in text.splitlines() if line.strip()]
+
+
+def chain_problems(entries: list[ManifestEntry]) -> list[Problem]:
+    """Check sequence numbers and the hash chain only (no file hashing).
+
+    Shared by `Manifest.verify` and the S3 backup, which checks an in-memory snapshot of
+    the manifest before uploading it.
+    """
+    problems: list[Problem] = []
+    prev = GENESIS
+    for i, e in enumerate(entries):
+        if e.seq != i:
+            problems.append(Problem(e.seq, e.path, f"sequence gap: expected seq {i}"))
+        if e.prev != prev:
+            problems.append(Problem(e.seq, e.path, "prev does not match the previous chain"))
+        if e.chain != e.expected_chain():
+            problems.append(Problem(e.seq, e.path, "chain mismatch: entry was edited"))
+        prev = e.chain
+    return problems
+
+
 class Manifest:
     def __init__(self, data_root: Path) -> None:
         self.root = data_root
@@ -145,14 +169,10 @@ class Manifest:
             entries = list(self.entries())
         except (ValueError, TypeError) as exc:
             return [Problem(None, None, f"manifest is unreadable: {exc}")]
-        for i, e in enumerate(entries):
-            if e.seq != i:
-                problems.append(Problem(e.seq, e.path, f"sequence gap: expected seq {i}"))
-            if e.prev != prev:
-                problems.append(Problem(e.seq, e.path, "prev does not match the previous chain"))
-            if e.chain != e.expected_chain():
-                problems.append(Problem(e.seq, e.path, "chain mismatch: entry was edited"))
-            prev = e.chain
+        problems.extend(chain_problems(entries))
+        if entries:
+            prev = entries[-1].chain
+        for e in entries:
             listed.add(e.path)
             file = self.root / e.path
             if not file.exists():

@@ -9,6 +9,9 @@
 #   scripts/vm.sh logs SERVICE [ARGS]    docker compose logs on the VM (e.g. --tail 50)
 #   scripts/vm.sh faulttest [ARGS]       `ppm faulttest` on the VM, next to the live stack
 #   scripts/vm.sh ssh [CMD]              shell (or one command) on the VM
+#   aws iam create-access-key … | scripts/vm.sh backup-key
+#                                        install the S3 backup key (JSON on stdin) on the VM
+#   scripts/vm.sh backup-check           prove the VM's key can add but never overwrite/delete
 #
 # Why a script: if PPM_HOST_DATA were forgotten, Compose would silently write the live
 # data into the checkout; if the project name were left to default, it would come from
@@ -25,7 +28,8 @@ die() {
   exit 1
 }
 
-vm_ip() { terraform -chdir="$ROOT/infra/terraform" output -raw vm_ip; }
+tf_output() { terraform -chdir="$ROOT/infra/terraform" output -raw "$1"; }
+vm_ip() { tf_output vm_ip; }
 
 on_vm() { ssh -i "$KEY" -o BatchMode=yes "ubuntu@$(vm_ip)" "$@"; }
 
@@ -35,10 +39,17 @@ PRELUDE=$(
   cat <<'VM'
 set -euo pipefail
 APP=/srv/ppm/app
+BACKUP_KEY=/srv/ppm/secrets/aws-backup
 export PATH="$HOME/.local/bin:$PATH"
 live() {
   cd "$APP"
+  # The backup service runs only once its key is installed (`vm.sh backup-key`), so a
+  # deploy before that still works; the bucket name is written by `vm.sh deploy`.
+  local profiles=""
+  [ -f "$BACKUP_KEY" ] && profiles=backup
   COMPOSE_PROJECT_NAME=ppm PPM_HOST_DATA=/srv/ppm/data PPM_HOST_SPOOL=/srv/ppm/spool \
+    COMPOSE_PROFILES=$profiles PPM_BACKUP_CREDENTIALS=$BACKUP_KEY \
+    PPM_BACKUP_BUCKET=$(cat /srv/ppm/backup-bucket 2>/dev/null || true) \
     docker compose "$@"
 }
 VM
@@ -95,8 +106,9 @@ cmd_deploy() {
     die "$sha is not on origin/main (use --branch for a pushed, unmerged commit)"
   fi
   echo "deploying $sha"
-  run_vm "$sha" <<'VM'
+  run_vm "$sha" "$(tf_output backup_bucket)" <<'VM'
 sha=$1
+printf '%s\n' "$2" >/srv/ppm/backup-bucket # not a secret; read by live()
 cd "$APP"
 git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
 git checkout --quiet --detach "$sha"
@@ -178,6 +190,63 @@ exit "$code"
 VM
 }
 
+# `vm.sh backup-key`, laptop side: AWS's create-access-key JSON (stdin) -> an AWS
+# credentials file (stdout). The key ID (not secret) goes to stderr for the summary.
+TO_CREDENTIALS_FILE='
+import json, sys
+key = json.load(sys.stdin)["AccessKey"]
+print(key["AccessKeyId"], file=sys.stderr)
+print("[default]")
+print("aws_access_key_id = " + key["AccessKeyId"])
+print("aws_secret_access_key = " + key["SecretAccessKey"])
+'
+
+# VM side: store the credentials file from stdin atomically (temp file, then rename),
+# readable only by uid 1000, outside the data directory so it can never be backed up.
+INSTALL_KEY=$(
+  cat <<'VM'
+set -eu
+umask 077
+d=/srv/ppm/secrets
+mkdir -p "$d"
+chmod 700 "$d"
+cat >"$d/.aws-backup.tmp"
+if [ ! -s "$d/.aws-backup.tmp" ]; then
+  rm -f "$d/.aws-backup.tmp"
+  exit 1
+fi
+chmod 400 "$d/.aws-backup.tmp"
+mv -f "$d/.aws-backup.tmp" "$d/aws-backup"
+stat -c '%n mode %a uid %u' "$d" "$d/aws-backup"
+VM
+)
+
+cmd_backup_key() {
+  # The secret only ever travels through pipes: never on screen, in shell history, or on
+  # the laptop's disk.
+  [ ! -t 0 ] || die "pipe the key in: aws iam create-access-key --user-name ppm-backup \
+--profile ppm --output json | scripts/vm.sh backup-key"
+  local id_file key_id
+  id_file=$(mktemp)
+  # -I: isolated mode (ignores PYTHON* env vars and modules in the current directory).
+  if ! python3 -I -c "$TO_CREDENTIALS_FILE" 2>"$id_file" | on_vm "$INSTALL_KEY"; then
+    key_id=$(head -c 200 "$id_file")
+    rm -f "$id_file"
+    die "install failed. If a key was created, delete it: aws iam delete-access-key \
+--user-name ppm-backup --profile ppm --access-key-id <id>  (stderr: $key_id)"
+  fi
+  key_id=$(cat "$id_file")
+  rm -f "$id_file"
+  echo "installed access key $key_id on the VM (secret not shown). Next: scripts/vm.sh deploy"
+}
+
+cmd_backup_check() {
+  run_vm <<'VM'
+[ -f "$BACKUP_KEY" ] || { echo "no backup key on the VM: run vm.sh backup-key first" >&2; exit 1; }
+live run --rm --no-deps -T backup backup --check-permissions </dev/null
+VM
+}
+
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -186,9 +255,11 @@ case "$cmd" in
   status) cmd_status ;;
   logs) cmd_logs "$@" ;;
   faulttest) cmd_faulttest "$@" ;;
+  backup-key) cmd_backup_key ;;
+  backup-check) cmd_backup_check ;;
   ssh) on_vm "$@" ;;
   *)
-    sed -n '2,12p' "$0" >&2
+    sed -n '2,15p' "$0" >&2
     exit 2
     ;;
 esac

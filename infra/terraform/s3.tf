@@ -93,6 +93,58 @@ data "aws_iam_policy_document" "backup_bucket" {
       values   = ["false"]
     }
   }
+
+  # Write-once for the VM (2c): its key may only CREATE objects under vm/, never replace
+  # one. An upload must carry `If-None-Match: *` ("only if this key doesn't exist"), so S3
+  # answers 412 instead of overwriting. Combined with the user policy's explicit Deny on
+  # deletes, everything the VM uploaded - above all the chain heads - stays exactly as
+  # first written, one version per key.
+  #
+  # Why here and not in the user policy: a Deny in the bucket policy still holds if the
+  # user's own policy is ever widened by mistake.
+  #
+  # Multipart uploads: CreateMultipartUpload and UploadPart can't carry the header, so
+  # they're exempt (s3:ObjectCreationOperation = false for them); the check happens on
+  # CompleteMultipartUpload, which is the moment the object appears. Side effect: no
+  # CopyObject into vm/ (we never copy). Pattern from the S3 user guide, "Enforce
+  # conditional writes on Amazon S3 buckets".
+  statement {
+    sid       = "BackupWriteOnceRequireIfNoneMatch"
+    effect    = "Deny"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.backup.arn}/vm/*"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_user.backup.arn]
+    }
+    condition {
+      test     = "Null"
+      variable = "s3:if-none-match"
+      values   = ["true"] # header absent
+    }
+    condition {
+      test     = "Bool"
+      variable = "s3:ObjectCreationOperation"
+      values   = ["true"] # PutObject / CompleteMultipartUpload, not the part uploads
+    }
+  }
+
+  # `If-Match: <etag>` means "overwrite if unchanged": exactly what write-once forbids.
+  statement {
+    sid       = "BackupWriteOnceDenyIfMatch"
+    effect    = "Deny"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.backup.arn}/vm/*"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_user.backup.arn]
+    }
+    condition {
+      test     = "Null"
+      variable = "s3:if-match"
+      values   = ["false"] # header present
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "backup" {

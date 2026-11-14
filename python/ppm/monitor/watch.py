@@ -129,7 +129,21 @@ class Recovered:
         return f"RECOVERED kind={self.kind} venue={self.venue} down_for_s={_secs(self.down_for_ms)}"
 
 
-Event = Gap | Silent | Failing | RedisUnreachable | ProbeAlert | Recovered
+@dataclass(frozen=True, slots=True)
+class BackupFailed:
+    """The S3 backup refused or failed a pass. `reason`: "fork" (the local chain no longer
+    extends the head already in S3), "integrity" (a local file or the manifest doesn't
+    match its hashes) or "error" (S3/network/credentials; retried next pass)."""
+
+    label: ClassVar[str] = "ALERT"
+    reason: str
+    detail: str
+
+    def format(self) -> str:
+        return f"ALERT kind=backup venue=s3 reason={self.reason} detail={self.detail!r}"
+
+
+Event = Gap | Silent | Failing | RedisUnreachable | ProbeAlert | BackupFailed | Recovered
 
 
 class VenueWatch:
