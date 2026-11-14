@@ -14,7 +14,9 @@ with a skew-corrected digital pricer (C++ core, in development).
   after SIGKILLing the writer mid-run, Docker restarted it in **0.9 s** and all **146/146** messages were written exactly once.
 - **Tamper-evident dataset.** Each day is compacted into one file per table and recorded in a SHA-256
   **hash chain**. `ppm verify` recomputes it in **0.28 s** and catches modified, deleted, swapped, inserted
-  or forged files. Corrections are appended, never rewritten.
+  or forged files. Corrections are appended, never rewritten. The chain head and merged files are
+  backed up to S3 **write-once**: a bucket policy requires `If-None-Match`, so the recording VM's key
+  can add objects but never overwrite or delete one (6/6 permission probes against real S3).
 - **Compaction:** 16 h of data went from 21,949 small files to **13 files** at half the bytes; 505k option rows fit in 7.8 MB.
 - **Real settlement data.** Collects Kalshi's actual BRTI settlement values and Polymarket resolutions. A test
   replays a real day: all 22 resolved Polymarket contracts match the Binance noon close under our bracket rules.

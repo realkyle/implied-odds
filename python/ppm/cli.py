@@ -5,6 +5,8 @@ ppm writer            run the Parquet writer
 ppm merge [--loop]    merge finished days into hash-chained daily files
 ppm verify            check the manifest hash chain and every file hash
 ppm monitor           alert when a venue goes silent or only fails; log every missing tick
+ppm backup [--loop]   copy new merged files, the manifest and the chain head to S3 (write-once)
+ppm restore --to DIR  rebuild a data directory from the S3 backup (then `ppm verify` it)
 ppm faulttest         inject faults into an isolated Compose stack; prove 0 lost / 0 duplicated
 """
 
@@ -16,17 +18,22 @@ import logging
 import signal
 import sys
 import time
+from pathlib import Path
 
 import httpx
 from redis.asyncio import Redis
 
+from ppm.backup.check import check_permissions
+from ppm.backup.job import BackupJob, BackupRefused, BackupReport
+from ppm.backup.restore import RestoreError, restore
+from ppm.backup.store import S3Store
 from ppm.config import Settings
 from ppm.faulttest.runner import SCENARIOS as FAULT_SCENARIOS
 from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
 from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
 from ppm.monitor.service import Monitor, build_watches
-from ppm.monitor.watch import ProbeAlert
+from ppm.monitor.watch import BackupFailed, ProbeAlert, Recovered
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
@@ -140,7 +147,7 @@ def _merge_summary(report) -> str:
 async def _monitor(settings: Settings, test_notify: bool) -> int:
     async with httpx.AsyncClient() as client:
         ntfy = NtfyNotifier(settings.ntfy_topic, client) if settings.ntfy_topic else None
-        notifier: Notifier = FanoutNotifier([LogNotifier(), *([ntfy] if ntfy else [])])
+        notifier = _notifier(ntfy)
         if test_notify:
             await LogNotifier().notify(ProbeAlert())
             if ntfy is None:
@@ -175,6 +182,130 @@ async def _monitor(settings: Settings, test_notify: bool) -> int:
     return 0
 
 
+def _notifier(ntfy: NtfyNotifier | None) -> Notifier:
+    """Always log; also push to the phone when PPM_NTFY_TOPIC is set."""
+    return FanoutNotifier([LogNotifier(), *([ntfy] if ntfy else [])])
+
+
+def _s3_client(settings: Settings):
+    import boto3  # deferred: only backup/restore need it, and it's slow to import
+    from botocore.config import Config
+
+    retries = Config(retries={"mode": "standard", "max_attempts": 5})
+    return boto3.client("s3", region_name=settings.backup_region, config=retries)
+
+
+# Hourly at :37, half an hour after the merger's :07 run. The pass is a catch-up, not a
+# fixed nightly job: a late merge, a reboot or an S3 outage is picked up on the next pass.
+BACKUP_EVERY_MS = 3_600_000
+BACKUP_OFFSET_MS = 37 * 60_000
+
+
+def next_backup_at(now: int) -> int:
+    """The next :37 strictly after `now`. (`next_tick` + offset would skip one: after a
+    startup pass at 10:20 it gives 11:37, not 10:37.)"""
+    at = floor_tick(now, BACKUP_EVERY_MS) + BACKUP_OFFSET_MS
+    return at if at > now else at + BACKUP_EVERY_MS
+
+
+def _alert_key(alert: BackupFailed) -> tuple[str, str]:
+    """What makes two backup alerts 'the same problem' for de-duplication. S3/network
+    errors compare by exception type only: their text carries request IDs that change
+    every hour, which would otherwise push the same outage hourly."""
+    if alert.reason == "error":
+        return alert.reason, alert.detail.split(":", 1)[0]
+    return alert.reason, alert.detail
+
+
+def _backup_summary(report: BackupReport) -> str:
+    if report.head is None:
+        return f"nothing new ({report.seconds:.1f} s)"
+    return (
+        f"head seq={report.head.seq} {report.head.head[:12]}…: {len(report.new_entries)} new "
+        f"entries, {report.files} files uploaded ({report.bytes / 1e6:.1f} MB), "
+        f"{report.already_there} already there, {report.seconds:.1f} s"
+    )
+
+
+async def _backup(settings: Settings, loop: bool, check: bool) -> int:
+    if not settings.backup_bucket:
+        print("PPM_BACKUP_BUCKET is not set", file=sys.stderr)
+        return 2
+    client = _s3_client(settings)
+    if check:
+        probes = check_permissions(client, settings.backup_bucket, settings.backup_prefix)
+        for p in probes:
+            print(f"{'PASS' if p.ok else 'FAIL'}  expected {p.expected}, got {p.actual}: {p.name}")
+        passed = len(probes) > 1 and all(p.ok for p in probes)
+        print("permission check PASSED" if passed else "permission check FAILED")
+        return 0 if passed else 1
+
+    job = BackupJob(
+        settings.data_dir, S3Store(settings.backup_bucket, client), settings.backup_prefix
+    )
+    log = logging.getLogger("ppm.backup")
+    if not loop:
+        try:
+            log.info("backup: %s", _backup_summary(job.run_once()))
+        except BackupRefused as exc:
+            log.error("backup REFUSED (%s): %s", exc.reason, exc.detail)
+            return 1
+        return 0
+
+    async with httpx.AsyncClient() as http:
+        ntfy = NtfyNotifier(settings.ntfy_topic, http) if settings.ntfy_topic else None
+        notifier = _notifier(ntfy)
+        stop = _stop_event()
+        log.info("backup started: s3://%s/%s", settings.backup_bucket, settings.backup_prefix)
+        failing_since: int | None = None
+        last_alert: tuple[str, str] | None = None
+        # First pass right away, so every deploy shows at once whether key and bucket
+        # work; then hourly at :37. (The pass is idempotent, so an extra one is harmless.)
+        run_at = now_ms()
+        while not stop.is_set():
+            if now_ms() >= run_at:
+                alert: BackupFailed | None = None
+                try:
+                    # boto3 is blocking; a thread keeps SIGTERM handling responsive. If the
+                    # container is killed mid-upload, nothing half-written becomes visible.
+                    report = await asyncio.to_thread(job.run_once)
+                    log.info("backup: %s", _backup_summary(report))
+                except BackupRefused as exc:
+                    alert = BackupFailed(exc.reason, exc.detail)
+                except Exception as exc:  # S3, network, credentials: retry next pass
+                    log.exception("backup pass failed")
+                    alert = BackupFailed("error", f"{type(exc).__name__}: {exc}")
+                if alert is not None:
+                    failing_since = failing_since or now_ms()
+                    if _alert_key(alert) != last_alert:  # one push per problem, not hourly
+                        await notifier.notify(alert)
+                    last_alert = _alert_key(alert)
+                elif failing_since is not None:
+                    await notifier.notify(Recovered("s3", "backup", now_ms() - failing_since))
+                    failing_since, last_alert = None, None
+                run_at = next_backup_at(now_ms())
+            await sleep_until(min(run_at, now_ms() + 60_000), stop)
+    return 0
+
+
+def _restore(settings: Settings, dest: str, seq: int | None) -> int:
+    if not settings.backup_bucket:
+        print("PPM_BACKUP_BUCKET is not set", file=sys.stderr)
+        return 2
+    store = S3Store(settings.backup_bucket, _s3_client(settings))
+    started = time.monotonic()
+    try:
+        head = restore(store, settings.backup_prefix, Path(dest), seq)
+    except RestoreError as exc:
+        print(f"restore failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"restored head seq={head.seq} into {dest} in {time.monotonic() - started:.1f} s; "
+        f"now run: PPM_DATA_DIR={dest} ppm verify --expect-head {head.head}"
+    )
+    return 0
+
+
 def _verify(settings: Settings, expect_head: str | None) -> int:
     manifest = Manifest(settings.data_dir)
     problems = manifest.verify(expect_head=expect_head)
@@ -201,6 +332,17 @@ def main(argv: list[str] | None = None) -> None:
     ver.add_argument("--expect-head", help="fail unless the chain ends at this value")
     mon = sub.add_parser("monitor", help="alert on silent or failing venues; log missing ticks")
     mon.add_argument("--test-notify", action="store_true", help="send one test alert and exit")
+    bak = sub.add_parser("backup", help="copy new merged data and the chain head to S3")
+    bmode = bak.add_mutually_exclusive_group()
+    bmode.add_argument("--loop", action="store_true", help="run hourly (at :37) as a service")
+    bmode.add_argument(
+        "--check-permissions",
+        action="store_true",
+        help="prove this key can add but never overwrite or delete (writes one probe object)",
+    )
+    rst = sub.add_parser("restore", help="rebuild a data directory from the S3 backup")
+    rst.add_argument("--to", required=True, help="new, empty directory to restore into")
+    rst.add_argument("--seq", type=int, help="restore the chain as of this head (default newest)")
     flt = sub.add_parser("faulttest", help="failure test on an isolated ppmtest Compose stack")
     flt.add_argument(
         "--scenario",
@@ -226,6 +368,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(_verify(settings, args.expect_head))
     elif args.command == "monitor":
         sys.exit(asyncio.run(_monitor(settings, args.test_notify)))
+    elif args.command == "backup":
+        sys.exit(asyncio.run(_backup(settings, args.loop, args.check_permissions)))
+    elif args.command == "restore":
+        sys.exit(_restore(settings, args.to, args.seq))
 
 
 if __name__ == "__main__":

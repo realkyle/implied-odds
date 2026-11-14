@@ -87,5 +87,31 @@ services:
       REDIS_URL: redis://redis:6379/0
       PPM_NTFY_TOPIC: ${PPM_NTFY_TOPIC:-}
 
+  # Copies new merged files, the manifest and the chain head to S3, write-once (hourly
+  # at :37). VM only: the `backup` profile is enabled by scripts/vm.sh, so a plain
+  # `docker compose up` on the laptop never starts it.
+  backup:
+    <<: *ppm
+    command: ["backup", "--loop"]
+    profiles: ["backup"]
+    depends_on: {} # needs no Redis: it reads only the merged files and the manifest
+    # Replaces the anchor's list (YAML merge is shallow): data read-only, no spool. The
+    # backup can read the dataset but can never change it.
+    volumes:
+      - ${PPM_HOST_DATA:-./data}:/data:ro
+    environment:
+      PPM_BACKUP_BUCKET: ${PPM_BACKUP_BUCKET:-}
+      PPM_NTFY_TOPIC: ${PPM_NTFY_TOPIC:-}
+      # boto3 reads the access key from here; nothing else in the stack can see it.
+      AWS_SHARED_CREDENTIALS_FILE: /run/secrets/aws_backup
+    secrets: [aws_backup]
+
+# A Compose "secret" from a file is a read-only bind mount into only the services that
+# list it (here: backup), at /run/secrets/<name>. It isn't encrypted; protection is the
+# host file's permissions (0400, uid 1000) and the narrow mount.
+secrets:
+  aws_backup:
+    file: ${PPM_BACKUP_CREDENTIALS:-/srv/ppm/secrets/aws-backup}
+
 volumes:
   redis-data:
