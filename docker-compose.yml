@@ -13,6 +13,8 @@ x-ppm: &ppm
   image: ppm:latest
   environment:
     REDIS_URL: redis://redis:6379/0
+    # How long the writer may be down before stream messages are trimmed unread (lost).
+    PPM_STREAM_RETAIN_H: ${PPM_STREAM_RETAIN_H:-12}
   volumes:
     - ${PPM_HOST_DATA:-./data}:/data
     - ${PPM_HOST_SPOOL:-./spool}:/spool
