@@ -3,8 +3,8 @@
 Status: **2a built and tested 2026-11-13** (Terraform base: VM, firewall, S3 bucket, IAM user).
 **2b deployed and tested 2026-11-14** (Compose stack running on the VM; `ppm faulttest` passes
 there; see §8). **2c1 deployed 2026-11-14** (write-once S3 backup service; the permission
-check passes against real S3; the first data upload waits for the VM's first merge; see §9).
-2c2 and 2d are not built yet.
+check passes against real S3); **first real upload 2026-11-15** (491.0 MB in 13.1 s; see §9).
+2c2, 2e and 2d are not built yet.
 
 ## 1. Problem and "done"
 
@@ -304,9 +304,27 @@ pushed via ntfy once per distinct problem; `RECOVERED` follows when a pass succe
 - Idle RAM of `backup`: **105 MiB** (estimate was 60–80). VM memory available after the
   deploy: 836 MB.
 - Image size: 454 → 510 MB (+56 MB for boto3/botocore; estimate was ~15 MB).
-- **Pending:** the first real upload. The VM's first merge is 2026-11-15 ~02:07 UTC, so
-  the first pass with data is at 02:37. Record its time and bytes, and how long a pass with
-  nothing new takes.
+
+### First real night (2026-11-15, deploy `8d3cbc9`)
+
+| What | Measured |
+|---|---|
+| VM merge of 2026-11-14 (02:09:29Z) | **147.8 s**, 140064 files → 13 files, 491.0 MB, 13 manifest entries |
+| Laptop merge of the same day | 56.7 s (139752 files, 489.6 MB); 2026-11-12 took 51.2 s |
+| First upload (02:37:13Z) | head seq=12 `cc61973da0e0…`, 13 files, **491.0 MB in 13.1 s** (~37 MB/s), 0 already there |
+| `backup-check` after deploying `8d3cbc9` (2026-11-14 04:53) | owner reported every probe PASS; `8d3cbc9` adds probe 7, HEAD of a missing key → 404 (6/6 on `4d8a971`) |
+| Next pass with nothing new | 03:37:00Z: `nothing new (0.3 s)` (0.0 s before any manifest existed; now it snapshots and checks the 13-entry chain against the stored head) |
+| Idle RAM of `backup` | **66.8 MiB** at 03:01Z, 24 min after the upload; 63.3 MiB right after the 03:37 pass (105 MiB on 2026-11-14 right after start) |
+
+- **The VM merges ~2.6× slower than the laptop** (147.8 s vs 56.7 s for the same day;
+  ~3× against the laptop's 51.2 s for 2026-11-12). It has 2 vCPUs that are burstable
+  and 2 GB of RAM with swap in use. Not a problem at :07 with the backup at :37, but the
+  30-minute gap shrinks if days grow; check again in 2d.
+- The two machines recorded slightly different file counts for the same day (VM +312).
+  Not investigated yet (the VM's day started at 00:23, so the laptop should have had more,
+  not fewer); 2d's coverage comparison has to explain it.
+- The 2026-11-14 RAM figure was measured right after start; idle after a real upload is
+  lower, inside the 60–80 MiB estimate.
 
 ### What went wrong
 
