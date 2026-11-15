@@ -143,7 +143,21 @@ class BackupFailed:
         return f"ALERT kind=backup venue=s3 reason={self.reason} detail={self.detail!r}"
 
 
-Event = Gap | Silent | Failing | RedisUnreachable | ProbeAlert | BackupFailed | Recovered
+@dataclass(frozen=True, slots=True)
+class BackupAudit:
+    """`ppm backup --status` (laptop, owner SSO) found a problem: the newest head is too
+    old, or a key has more than one version or a delete marker."""
+
+    label: ClassVar[str] = "ALERT"
+    detail: str
+
+    def format(self) -> str:
+        return f"ALERT kind=backup-audit venue=s3 detail={self.detail!r}"
+
+
+Event = (
+    Gap | Silent | Failing | RedisUnreachable | ProbeAlert | BackupFailed | BackupAudit | Recovered
+)
 
 
 class VenueWatch:

@@ -6,6 +6,7 @@ ppm merge [--loop]    merge finished days into hash-chained daily files
 ppm verify            check the manifest hash chain and every file hash
 ppm monitor           alert when a venue goes silent or only fails; log every missing tick
 ppm backup [--loop]   copy new merged files, the manifest and the chain head to S3 (write-once)
+ppm backup --status   (laptop, owner SSO) is the S3 backup fresh, and is every key 1 version?
 ppm restore --to DIR  rebuild a data directory from the S3 backup (then `ppm verify` it)
 ppm faulttest         inject faults into an isolated Compose stack; prove 0 lost / 0 duplicated
 """
@@ -23,6 +24,7 @@ from pathlib import Path
 import httpx
 from redis.asyncio import Redis
 
+from ppm.backup.audit import S3VersionLister, VersionLister, audit
 from ppm.backup.check import check_permissions
 from ppm.backup.job import BackupJob, BackupRefused, BackupReport
 from ppm.backup.restore import RestoreError, restore
@@ -33,7 +35,7 @@ from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
 from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
 from ppm.monitor.service import Monitor, build_watches
-from ppm.monitor.watch import BackupFailed, ProbeAlert, Recovered
+from ppm.monitor.watch import BackupAudit, BackupFailed, ProbeAlert, Recovered
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
@@ -288,6 +290,49 @@ async def _backup(settings: Settings, loop: bool, check: bool) -> int:
     return 0
 
 
+async def _backup_status(settings: Settings, lister: VersionLister | None = None) -> int:
+    """Exit 0: fresh and write-once held. 1: a problem (logged, pushed to ntfy).
+    2: couldn't check (no bucket, expired SSO, S3 error); printed only, since this runs
+    on demand and the owner is looking at the terminal."""
+    if not settings.backup_bucket:
+        print("PPM_BACKUP_BUCKET is not set", file=sys.stderr)
+        return 2
+    started = time.monotonic()
+    try:
+        # Building the client is inside the try: a missing profile fails here, not at
+        # the first request, and must still be exit 2, never a traceback with exit 1.
+        if lister is None:
+            lister = S3VersionLister(settings.backup_bucket, _s3_client(settings))
+        versions = await asyncio.to_thread(lister.list_versions, settings.backup_prefix)
+        versioning = await asyncio.to_thread(lister.versioning_status)
+    except Exception as exc:  # profile, credentials, SSO token, network, AccessDenied
+        print(f"cannot check: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("(expired SSO? run `aws sso login --profile ppm`)", file=sys.stderr)
+        return 2
+    report = audit(versions, now_ms(), settings.backup_prefix, versioning=versioning)
+    seconds = time.monotonic() - started
+    for line in report.lines():
+        print(line)
+    for problem in report.problems:
+        print(f"PROBLEM  {problem}")
+    print(f"backup status {'OK' if report.ok else 'PROBLEM'} ({seconds:.1f} s)")
+    if report.ok:
+        return 0
+    async with httpx.AsyncClient() as http:
+        ntfy = NtfyNotifier(settings.ntfy_topic, http) if settings.ntfy_topic else None
+        await _notifier(ntfy).notify(BackupAudit(_audit_detail(report.problems)))
+    return 1
+
+
+def _audit_detail(problems: tuple[str, ...], shown: int = 3) -> str:
+    """The alert text: a count plus the first few problems. A bulk overwrite could flag
+    hundreds of keys, and ntfy turns a body over 4096 bytes into an attachment, so the
+    phone would show no text. The terminal output still lists every problem."""
+    head = "; ".join(problems[:shown])
+    more = len(problems) - shown
+    return f"{len(problems)} problems: {head}" + (f"; … {more} more" if more > 0 else "")
+
+
 def _restore(settings: Settings, dest: str, seq: int | None) -> int:
     if not settings.backup_bucket:
         print("PPM_BACKUP_BUCKET is not set", file=sys.stderr)
@@ -340,6 +385,12 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="prove this key can add but never overwrite or delete (writes one probe object)",
     )
+    bmode.add_argument(
+        "--status",
+        action="store_true",
+        help="(owner SSO) newest head age and 1-version-per-key check; exit 0 ok, 1 problem, "
+        "2 cannot check",
+    )
     rst = sub.add_parser("restore", help="rebuild a data directory from the S3 backup")
     rst.add_argument("--to", required=True, help="new, empty directory to restore into")
     rst.add_argument("--seq", type=int, help="restore the chain as of this head (default newest)")
@@ -368,6 +419,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(_verify(settings, args.expect_head))
     elif args.command == "monitor":
         sys.exit(asyncio.run(_monitor(settings, args.test_notify)))
+    elif args.command == "backup" and args.status:
+        sys.exit(asyncio.run(_backup_status(settings)))
     elif args.command == "backup":
         sys.exit(asyncio.run(_backup(settings, args.loop, args.check_permissions)))
     elif args.command == "restore":
