@@ -148,18 +148,33 @@ cd "$APP"
 git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
 prev=$(git rev-parse HEAD)
 git checkout --quiet --detach "$sha"
-
-# 1. Build while the old containers keep recording. A failed build changes nothing that
-#    runs: the ppm:latest tag moves only on success, and the checkout goes back to the
-#    commit the containers were built from, so `vm.sh status` stays truthful.
-start=$(date +%s)
-if ! live build </dev/null; then
+# Stop before any container is touched: put the checkout back to the commit the running
+# containers were built from (so `vm.sh status` stays truthful) and log why.
+abort_unchanged() {
   git checkout --quiet --detach "$prev"
-  echo "$(date -u +%FT%TZ) $sha build FAILED; nothing recreated, still ${prev:0:7}" |
+  echo "$(date -u +%FT%TZ) $sha $1; nothing recreated, still ${prev:0:7}" |
     tee -a /srv/ppm/deploys.log >&2
   exit 1
-fi
+}
+
+# 1. Build while the old containers keep recording. A failed build changes nothing that
+#    runs: the ppm:latest tag moves only on success.
+start=$(date +%s)
+live build </dev/null || abort_unchanged "build FAILED"
 build_s=$(($(date +%s) - start))
+# A process substitution's failure is invisible to set -e, and an empty list would make
+# --force-recreate hit every service, Redis included: check it here instead.
+services=()
+if [ "$recreate" = 1 ]; then
+  mapfile -t services < <(live config --services | grep -vx redis)
+  [ "${#services[@]}" -gt 0 ] || abort_unchanged "no services from compose config"
+fi
+# The laptop refused 01:55-03:30 before the build; a very slow build could still run
+# into the merge, so check again on this clock before recreating anything.
+hhmm=$(date -u +%H%M)
+if ((10#$hhmm >= 155 && 10#$hhmm < 330)); then
+  abort_unchanged "build ended at $hhmm UTC, inside the merge/backup window"
+fi
 
 # 2. Wait until :10 past a minute on THIS machine's clock (the one the recorders tick
 #    on). A tick is lost only if a recreate spans :00: the old recorder, asleep waiting
@@ -174,12 +189,15 @@ sleep "$wait_s"
 # 3. Recreate. --no-build: the image was built above. --recreate restarts every app
 #    service, never Redis: its restart would make everything wait on its healthcheck.
 args=(up -d --wait --remove-orphans --no-build)
-if [ "$recreate" = 1 ]; then
-  mapfile -t services < <(live config --services | grep -vx redis)
-  args+=(--force-recreate --no-deps "${services[@]}")
-fi
+[ "$recreate" = 0 ] || args+=(--force-recreate --no-deps "${services[@]}")
 t0=$(now)
-live "${args[@]}" </dev/null
+if ! live "${args[@]}" </dev/null; then
+  # Containers may now be a mix of old and new, so the checkout stays at $sha.
+  echo "$(date -u +%FT%TZ) $sha recreate FAILED from :$(mmss "$t0"); containers may be mixed" |
+    tee -a /srv/ppm/deploys.log >&2
+  live ps --format 'table {{.Service}}\t{{.Status}}' </dev/null
+  exit 1
+fi
 t1=$(now)
 recreate_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
 echo "recreate :$(mmss "$t0") -> :$(mmss "$t1") (${recreate_s} s)"
