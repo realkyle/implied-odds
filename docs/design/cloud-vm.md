@@ -4,7 +4,8 @@ Status: **2a built and tested 2026-11-13** (Terraform base: VM, firewall, S3 buc
 **2b deployed and tested 2026-11-14** (Compose stack running on the VM; `ppm faulttest` passes
 there; see §8). **2c1 deployed 2026-11-14** (write-once S3 backup service; the permission
 check passes against real S3); **first real upload 2026-11-15** (491.0 MB in 13.1 s; see §9).
-2c2, 2e and 2d are not built yet.
+**2c2 tested 2026-11-15** (restore + tamper; §10). **2e deployed and tested 2026-11-15**
+(tick-aligned deploy, 0 ticks lost in 4 deploys; §11). 2f and 2d are not built yet.
 
 ## 1. Problem and "done"
 
@@ -147,7 +148,7 @@ plain tokens, because SSH re-splits them on the VM.
 | Command | Does |
 |---|---|
 | `bootstrap` | idempotent: `g++` (apt), uv 0.13.7 (pinned official installer), https clone to `/srv/ppm/app` |
-| `deploy [--branch] [REF]` | refuses a SHA not on `origin/main` (or, with `--branch`, not pushed); checkout `--detach`; `up -d --build --wait`; appends to `deploys.log` |
+| `deploy [--branch] [--recreate] [REF]` | refuses 01:55–03:30 UTC and a SHA not on `origin/main` (or, with `--branch`, not pushed); checkout `--detach`; `build` (fail → checkout restored, exit 1); wait for :10 past the minute; `up -d --wait --no-build`; tick check; appends to `deploys.log` (§11, 2e) |
 | `status` | deployed SHA, services, `free -m`, disk, Redis memory + per-stream length/bytes, last monitor alerts |
 | `logs SERVICE [ARGS]` | `docker compose logs` for the live project |
 | `faulttest [ARGS]` | refuses 01:25–03:30 UTC (daily merge at 02:07); `uv sync --no-dev`, then `uv run --no-sync ppm faulttest` detached under `nohup`, with RAM/swap sampled every 10 s and per-container memory every 60 s |
@@ -431,3 +432,93 @@ disaster recovery; a restore onto an AWS machine would be much faster.
 - **A stale head is still only caught by hand** until 2f lands.
 - The test checked the newest head only. Restoring an older seq (`--seq`) gets its first
   real use once there are several heads.
+
+## 11. Stage 2e: tick-aligned deploy (2026-11-15)
+
+**Problem.** The 2026-11-14 01:19 redeploy lost the 01:19 tick for all four minute venues.
+Once the VM is canonical (2d), that is real data loss.
+
+**Root cause.** Recorders fire at :00 on the VM clock (`recorders/base.py`). SIGTERM only
+sets a stop flag, so a tick that has started always finishes (30 s `stop_grace_period`).
+But a recorder that is *asleep waiting for :00* exits at once, and its replacement waits
+for the *next* :00. A tick is therefore lost only when a recreate spans :00. `up -d --build`
+recreated the moment the build ended. On 01:19 that was ~01:19:05, which straddled :00.
+The 04:53 deploy recreated at :31 and lost nothing.
+
+**Done (2e):**
+- Build first, then recreate at :10 past a minute.
+- 3 deploys in a row with 0 GAP lines and every venue present every minute.
+- A failing build changes nothing that runs.
+
+### Design (decided 2026-11-15)
+
+```
+laptop: vm.sh deploy [--branch] [--recreate] REF
+  refuse 01:55–03:30 UTC (laptop clock)  ·  REF must be on origin/main (or pushed)
+  VM:  prev=HEAD → checkout SHA
+       compose build ─ fail ─▶ checkout prev, log "build FAILED", exit 1   (nothing recreated)
+       (--recreate) services = compose config --services minus redis; empty ─▶ abort, same way
+       still 01:55–03:30 on the VM clock? ─▶ abort, same way
+       sleep until :10 past the minute (VM clock)
+       up -d --wait --no-build [--force-recreate --no-deps services]
+             └ fail ─▶ log "recreate FAILED", exit 1   (checkout stays: containers may be mixed)
+       sleep until :25 past the minute after the recreate ended
+       tick check: staging fetch_log files HHMM_<venue>_* for every minute in that range,
+                   deribit kalshi polymarket reference ─▶ deploys.log, exit 1 if any are 0
+```
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Wait for :10 on the **VM's** clock | Wait on the laptop | The recorders tick on the VM clock; SSH latency and laptop clock skew don't matter. The VM is NTP-synced (`timedatectl`) |
+| :10 | :02; :30 | By :10 tick T has fired. One still running finishes inside the 30 s grace. A ~6–15 s recreate leaves 35 s+ before T+1 |
+| `--recreate` flag: force-recreate every app service, never Redis | Always force-recreate; prove with 3 image-changing commits | `scripts/` and `docs/` aren't in the image, so most deploys recreate nothing (same image ID). The flag gives real, repeatable restarts. A Redis restart would make everything wait on its healthcheck |
+| Tick check built into every deploy (~60–75 s extra) | Check by hand for this item only | Every future deploy proves it lost nothing and records the number |
+| Refuse 01:55–03:30 UTC, no override; re-checked on the VM after the build | Override flag; no guard | Don't restart the merger mid-merge (~2.5 min on the VM) or the 02:37 backup. Emergency: ssh and run Compose by hand |
+| Failure test with a throwaway pushed branch (`RUN false`) | Test-only env hook in `vm.sh` | Real path on the real VM; no test hook in production code |
+
+### Results (2026-11-15, VM, all UTC)
+
+| Run | Commit | Recreate (VM clock) | Tick check | ticks missed |
+|---|---|---|---|---|
+| failure test | `fb0c5d2` (`RUN false`) | none: exit 1 at 07:45:22; all 10 containers' `CreatedAt` unchanged (04:53:31, Redis 00:23:18); checkout back at `8d3cbc9` | n/a | 0 |
+| deploy 1 | `b0f682c` | :46:10.1 → :46:25.5 (15.4 s) | 07:46, 07:47 all present | 0 |
+| deploy 2 | `b0f682c` | :48:10.1 → :48:20.4 (10.3 s) | 07:48, 07:49 | 0 |
+| deploy 3 | `b0f682c` | :52:10.1 → :52:20.0 (9.9 s) | 07:52, 07:53 | 0 |
+| deploy 4 (after review fixes) | `84fe5b7` | :55:10.0 → :55:16.2 (6.3 s) | 07:55, 07:56 | 0 |
+
+- **Whole window, build phases included:** staging `fetch_log` files for 07:40–07:53. Every
+  minute had deribit 6, kalshi 4, reference 4 and polymarket 20–21 files.
+- **Monitor and recorders:** 0 `missed tick`, `GAP` or `ALERT` lines. The monitor seeds from
+  the newest tick on the stream at start-up, so it would have seen a gap across its own
+  restart.
+- **Build time:** 2–3 s, all cached. A real code change costs ~60–90 s, as in 2b/2c1.
+- **Redis:** never recreated (still up 31 h).
+- **Polymarket 21 vs 20 files.** Seen in the first minute after each recreate, and also at
+  07:44, before any deploy. So it isn't purely a restart effect (2b/2c1 had seen 17 vs 16).
+  It is an extra fetch, not a miss. To explain before 2d's coverage comparison.
+
+### What went wrong
+
+- **An awk `>` was read as a redirect.** `printf "%.3f", d > 0 ? d : 0` writes to a file named
+  `0` instead of comparing. shellcheck can't see it, because awk code is a quoted string to
+  shellcheck. It was caught by running the extracted tick-check code read-only on the VM
+  against real staging data before any deploy. Fixed with parentheses.
+- **An accidental `vm.sh faulttest` call.** A refusal test of `faulttest` at a fake 01:24
+  passed the guard and really ran on the VM. argparse rejected the bogus argument at once,
+  so no test stack started. It left `.faulttest/vm-20261115T074210Z` (4 small files).
+  Lesson: a refusal test for a time that *should pass* must also carry a bad option that
+  stops it locally.
+- **Diff review (subagent).** No significant findings; 3 minor ones fixed in `84fe5b7`:
+  - An empty service list (a process substitution's failure is invisible to `set -e`)
+    would have force-recreated Redis.
+  - A failed `up` left no line in `deploys.log`.
+  - A build that ran past 01:55 wasn't re-checked on the VM.
+
+### Open risks after 2e
+
+- `ppm:latest` moves on a successful build even if the deploy then aborts (window, empty
+  services, Ctrl-C during the wait). Running containers keep their image ID, but the next
+  `live up` of anything would pick up the new image.
+- The tick check covers the recreate minutes. A tick lost *during the build* (a heavy C++
+  build starving a recorder on the 2 GB VM) shows only as a recorder `missed tick` line and
+  a monitor GAP line, not in the deploy's own count.
