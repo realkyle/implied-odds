@@ -3,8 +3,11 @@
 # so the VM-only settings below are applied the same way every time.
 #
 #   scripts/vm.sh bootstrap              once: g++ and uv on the VM, clone the repo
-#   scripts/vm.sh deploy [REF]           run commit REF (default origin/main) on the VM
+#   scripts/vm.sh deploy [REF]           run commit REF (default origin/main) on the VM:
+#                                        build, recreate at :10 past a minute, check ticks
 #   scripts/vm.sh deploy --branch REF    allow a pushed commit that isn't on main yet
+#   scripts/vm.sh deploy --recreate      also restart app services whose image is unchanged
+#                                        (refuses 01:55-03:30 UTC: daily merge and backup)
 #   scripts/vm.sh status                 deployed commit, services, memory, disk, Redis
 #   scripts/vm.sh logs SERVICE [ARGS]    docker compose logs on the VM (e.g. --tail 50)
 #   scripts/vm.sh faulttest [ARGS]       `ppm faulttest` on the VM, next to the live stack
@@ -88,13 +91,34 @@ echo "g++ $(g++ -dumpversion), $(uv --version), checkout $(git -C "$APP" rev-par
 VM
 }
 
-cmd_deploy() {
-  local allow_branch=0
-  if [ "${1:-}" = "--branch" ]; then
-    allow_branch=1
-    shift
+# refuse_in_window FROM TO WHY: stop here if the UTC time is in [FROM, TO) (HHMM). It uses
+# the laptop's clock; the windows have minutes of margin, so a little clock skew is fine.
+refuse_in_window() {
+  local hhmm
+  hhmm=$(date -u +%H%M)
+  if ((10#$hhmm >= 10#$1 && 10#$hhmm < 10#$2)); then # 10#: "0830" is decimal, not octal
+    die "refusing at $hhmm UTC: $3 (allowed outside ${1:0:2}:${1:2}-${2:0:2}:${2:2})"
   fi
-  local ref=${1:-origin/main} sha
+}
+
+cmd_deploy() {
+  # Recreating the merger mid-merge (~2.5 min on the VM from 02:07) or the backup (02:37)
+  # would interrupt them. No override: in an emergency, ssh in and run Compose by hand.
+  refuse_in_window 0155 0330 "the daily merge (02:07) and backup (02:37) run then"
+  local allow_branch=0 recreate=0 ref="" sha
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) allow_branch=1 ;;
+      --recreate) recreate=1 ;; # restart every app service even if its image is unchanged
+      -*) die "unknown option: $1" ;;
+      *)
+        [ -z "$ref" ] || die "only one REF allowed"
+        ref=$1
+        ;;
+    esac
+    shift
+  done
+  ref=${ref:-origin/main}
   # --prune: a branch deleted on GitHub (after a squash-merge) must not still count as pushed.
   git -C "$ROOT" fetch --quiet --prune origin
   sha=$(git -C "$ROOT" rev-parse --verify --quiet "$ref^{commit}") || die "unknown ref: $ref"
@@ -106,17 +130,107 @@ cmd_deploy() {
   else
     die "$sha is not on origin/main (use --branch for a pushed, unmerged commit)"
   fi
-  echo "deploying $sha"
-  run_vm "$sha" "$(tf_output backup_bucket)" <<'VM'
-sha=$1
+  echo "deploying $sha (recreate=$recreate)"
+  run_vm "$sha" "$(tf_output backup_bucket)" "$recreate" <<'VM'
+sha=$1 recreate=$3
 printf '%s\n' "$2" >/srv/ppm/backup-bucket # not a secret; read by live()
+# Minute venues: one fetch each per minute. Settlements is hourly, so a 2-minute check
+# can't see it (and it re-collects the current hour when it restarts anyway).
+MINUTE_VENUES="deribit kalshi polymarket reference"
+FETCH_LOG=/srv/ppm/data/staging/fetch_log
+now() { date +%s.%N; }
+# Seconds (fractional) from now until epoch $1; 0 if that is already past.
+# (Parentheses matter: in awk, an unbracketed `>` in printf's arguments is a redirect.)
+secs_until() { awk -v t="$1" -v n="$(now)" 'BEGIN { d = t - n; printf "%.3f", (d > 0 ? d : 0) }'; }
+mmss() { date -u -d "@$1" +%M:%S.%1N; }
+
 cd "$APP"
 git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
+prev=$(git rev-parse HEAD)
 git checkout --quiet --detach "$sha"
+# Stop before any container is touched: put the checkout back to the commit the running
+# containers were built from (so `vm.sh status` stays truthful) and log why.
+abort_unchanged() {
+  git checkout --quiet --detach "$prev"
+  echo "$(date -u +%FT%TZ) $sha $1; nothing recreated, still ${prev:0:7}" |
+    tee -a /srv/ppm/deploys.log >&2
+  exit 1
+}
+
+# 1. Build while the old containers keep recording. A failed build changes nothing that
+#    runs: the ppm:latest tag moves only on success.
 start=$(date +%s)
-live up -d --build --wait --remove-orphans
-echo "$(date -u +%FT%TZ) $sha build+start $(($(date +%s) - start)) s" | tee -a /srv/ppm/deploys.log
+live build </dev/null || abort_unchanged "build FAILED"
+build_s=$(($(date +%s) - start))
+# A process substitution's failure is invisible to set -e, and an empty list would make
+# --force-recreate hit every service, Redis included: check it here instead.
+services=()
+if [ "$recreate" = 1 ]; then
+  mapfile -t services < <(live config --services | grep -vx redis)
+  [ "${#services[@]}" -gt 0 ] || abort_unchanged "no services from compose config"
+fi
+# The laptop refused 01:55-03:30 before the build; a very slow build could still run
+# into the merge, so check again on this clock before recreating anything.
+hhmm=$(date -u +%H%M)
+if ((10#$hhmm >= 155 && 10#$hhmm < 330)); then
+  abort_unchanged "build ended at $hhmm UTC, inside the merge/backup window"
+fi
+
+# 2. Wait until :10 past a minute on THIS machine's clock (the one the recorders tick
+#    on). A tick is lost only if a recreate spans :00: the old recorder, asleep waiting
+#    for :00, exits on SIGTERM, and the new one waits for the following :00. By :10 tick T
+#    has fired (one still running finishes inside the 30 s stop grace), and the ~20 s
+#    recreate ends well before T+1. Already at :10-:11 → go now.
+wait_s=$(awk -v t="$(now)" 'BEGIN { s = t % 60; w = 10 - s
+  if (w < -2) w += 60; if (w < 0) w = 0; printf "%.3f", w }')
+echo "build ${build_s} s; waiting ${wait_s} s for :10 past the minute"
+sleep "$wait_s"
+
+# 3. Recreate. --no-build: the image was built above. --recreate restarts every app
+#    service, never Redis: its restart would make everything wait on its healthcheck.
+args=(up -d --wait --remove-orphans --no-build)
+[ "$recreate" = 0 ] || args+=(--force-recreate --no-deps "${services[@]}")
+t0=$(now)
+if ! live "${args[@]}" </dev/null; then
+  # Containers may now be a mix of old and new, so the checkout stays at $sha.
+  echo "$(date -u +%FT%TZ) $sha recreate FAILED from :$(mmss "$t0"); containers may be mixed" |
+    tee -a /srv/ppm/deploys.log >&2
+  live ps --format 'table {{.Service}}\t{{.Status}}' </dev/null
+  exit 1
+fi
+t1=$(now)
+recreate_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
+echo "recreate :$(mmss "$t0") -> :$(mmss "$t1") (${recreate_s} s)"
 live ps --format 'table {{.Service}}\t{{.Status}}'
+
+# 4. Tick check: every minute venue must have fetch_log files for each minute from the
+#    one the recreate started in to the one after it ended. Writer lag is a few seconds;
+#    wait until :25 past the last minute so its files are there.
+first=$(awk -v t="$t0" 'BEGIN { printf "%d", int(t / 60) * 60 }')
+last=$(awk -v t="$t1" 'BEGIN { printf "%d", (int(t / 60) + 1) * 60 }')
+sleep "$(secs_until $((last + 25)))"
+missed=0
+header="venue      "
+for ((m = first; m <= last; m += 60)); do header+=" $(date -u -d "@$m" +%H%M)"; done
+echo "tick check (fetch_log files per minute)"
+echo "$header"
+for venue in $MINUTE_VENUES; do
+  row=$(printf '%-11s' "$venue")
+  for ((m = first; m <= last; m += 60)); do
+    dir="$FETCH_LOG/date=$(date -u -d "@$m" +%F)"
+    # `|| true`: no directory yet for that date means 0 files, not a failed deploy
+    # (pipefail would otherwise end the script here).
+    n=$({ find "$dir" -maxdepth 1 -name "$(date -u -d "@$m" +%H%M)_${venue}_*" 2>/dev/null ||
+      true; } | wc -l)
+    row+=$(printf ' %4d' "$n")
+    [ "$n" -gt 0 ] || missed=$((missed + 1))
+  done
+  echo "$row"
+done
+echo "ticks missed: $missed"
+echo "$(date -u +%FT%TZ) $sha build ${build_s} s, recreate=$recreate :$(mmss "$t0")->:$(mmss "$t1")" \
+  "(${recreate_s} s), ticks missed $missed" | tee -a /srv/ppm/deploys.log
+[ "$missed" -eq 0 ] || { echo "MISSED TICKS: check vm.sh status for GAP lines" >&2; exit 1; }
 VM
 }
 
@@ -149,11 +263,7 @@ VM
 cmd_faulttest() {
   # The daily merge runs from 02:07 UTC and reads a whole day of files; the test takes
   # ~30 min and shares the 2 GB of RAM, so it must neither start nor run into that.
-  local hhmm
-  hhmm=$(date -u +%H%M)
-  if ((10#$hhmm >= 125 && 10#$hhmm < 330)); then # 10#: "0830" is decimal, not octal
-    die "refusing at $hhmm UTC: too close to the 02:07 daily merge (allowed outside 01:25-03:30)"
-  fi
+  refuse_in_window 0125 0330 "too close to the 02:07 daily merge"
   run_vm "$@" <<'VM'
 cd "$APP"
 # The harness runs on the host: it drives the docker CLI and reads the run's Parquet.
@@ -260,7 +370,7 @@ case "$cmd" in
   backup-check) cmd_backup_check ;;
   ssh) on_vm "$@" ;;
   *)
-    sed -n '2,15p' "$0" >&2
+    sed -n '2,18p' "$0" >&2
     exit 2
     ;;
 esac
