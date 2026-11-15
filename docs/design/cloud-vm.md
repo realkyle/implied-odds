@@ -373,3 +373,61 @@ pushed via ntfy once per distinct problem; `RECOVERED` follows when a pass succe
   Negligible; the owner can delete `vm/probe/` by hand.
 - **Key rotation is manual:** create a second key, run `vm.sh backup-key`, redeploy, then
   delete the old key.
+
+## 10. Stage 2c2: restore and tamper tests (2026-11-15)
+
+**Problem.** 2c1 showed the VM can only *add* objects under `vm/`. 2c2 has to show the
+other half: the backup is enough to rebuild the data, and the head in S3 catches a
+truncation that `ppm verify` alone misses.
+
+**Done (2c2):**
+- A restore from S3 verifies against the S3 head.
+- A truncated copy fails against that head.
+- Every `vm/` key has exactly one version.
+
+**How it was run.** Everything ran as the owner's SSO session (`AWS_PROFILE=ppm`), never
+with the VM's key, and the backup policy was not changed. The restore went into a new
+scratch directory outside the repo. The VM was only read: one `tail` of its
+`manifest.jsonl`.
+
+### Results (2026-11-15 ~05:06Z, laptop, home internet)
+
+| Step | Result |
+|---|---|
+| Head in S3 | `vm/heads/000012.json`: seq=12, chain `cc61973da0e0a2b5…9ab9cfe4`. It is the only head, written 02:37:14Z |
+| VM's own manifest | 13 lines; the last has seq=12 and the **same** chain value |
+| `ppm restore --to <scratch>` | 13 files + manifest, 491,017,195 bytes (sum of file sizes; `du` shows 496M with block overhead), **57.1 s** (58.1 s wall time including `uv run`), ~8.6 MB/s |
+| `verify --expect-head cc6197…` on the restore | **PASS**: 13 entries, 0.58 s; every file re-hashed |
+| Cut the last line (seq 12) off the copy's manifest, then `verify --expect-head` | **FAIL**: an orphaned file, plus head `4715dddc…` ≠ `cc61973d…` |
+| Same truncation, plain `verify` | **FAIL**: `archive/settlements/date=2026-11-14/raw-1.tar: file is not in the manifest` |
+| Truncation, with that file also moved out of the copy, plain `verify` | **PASS**: 12 entries, head `4715dddc…` |
+| Same, `verify --expect-head cc6197…` | **FAIL**: head mismatch |
+| `list-object-versions --prefix vm/` | 17 keys, **17 versions, 0 delete markers**, all latest. That is 13 data files, 1 manifest snapshot, 1 head and 2 probes |
+| `vm/probe/` | 2 objects, 23 B each (from the backup-checks at 2026-11-14 03:08 and 04:56). Owner decided to **keep** them: deleting would add delete markers |
+| Age of the newest `vm/heads/` key | 2 h 30 min at 05:07Z (threshold ~26 h). OK |
+
+**What the tamper test shows.** A naive truncation is already caught without the head,
+because `verify` also flags files on disk that aren't in the manifest. A tamperer who
+cuts the line *and* takes its file away leaves a shorter chain that is still valid, and
+plain `verify` passes it. Only a head recorded somewhere the VM can't rewrite catches
+that. §9 says "A truncated `manifest.jsonl` is still a valid chain, so `ppm verify`
+passes unless it's given a head". That holds only for this careful version, and the run
+showed the difference.
+
+**Restore speed.** Upload from the VM ran at ~37 MB/s; this download to the laptop ran at
+~8.6 MB/s, which is the home connection. Restoring the full dataset is about one minute
+per recorded day from here. At ~0.5 GB/day, a year is ~180 GB and ~6 h. That is fine for
+disaster recovery; a restore onto an AWS machine would be much faster.
+
+### Decisions
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Keep the `vm/probe/` objects | Delete by version id; plain delete (adds markers) | 46 bytes. A clean "1 version per key, 0 markers" is a better invariant to keep |
+| A repeatable freshness check (head age plus the version invariant) gets its own PLAN item, 2f, before 2d; not built in 2c2 | Build it now; accept the risk | One task per session. 2d makes the VM canonical, so the check has to exist by then |
+
+### Open risks after 2c2
+
+- **A stale head is still only caught by hand** until 2f lands.
+- The test checked the newest head only. Restoring an older seq (`--seq`) gets its first
+  real use once there are several heads.
