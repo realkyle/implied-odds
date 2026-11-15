@@ -5,7 +5,8 @@ Status: **2a built and tested 2026-11-13** (Terraform base: VM, firewall, S3 buc
 there; see §8). **2c1 deployed 2026-11-14** (write-once S3 backup service; the permission
 check passes against real S3); **first real upload 2026-11-15** (491.0 MB in 13.1 s; see §9).
 **2c2 tested 2026-11-15** (restore + tamper; §10). **2e deployed and tested 2026-11-15**
-(tick-aligned deploy, 0 ticks lost in 4 deploys; §11). 2f and 2d are not built yet.
+(tick-aligned deploy, 0 ticks lost in 4 deploys; §11). **2f built and tested 2026-11-15**
+(`ppm backup --status`, owner SSO, on demand; §12). 2d is not built yet.
 
 ## 1. Problem and "done"
 
@@ -429,7 +430,8 @@ disaster recovery; a restore onto an AWS machine would be much faster.
 
 ### Open risks after 2c2
 
-- **A stale head is still only caught by hand** until 2f lands.
+- **A stale head is still only caught by hand** until 2f lands. (2f landed 2026-11-15, §12;
+  still on demand, not scheduled.)
 - The test checked the newest head only. Restoring an older seq (`--seq`) gets its first
   real use once there are several heads.
 
@@ -522,3 +524,73 @@ laptop: vm.sh deploy [--branch] [--recreate] REF
 - The tick check covers the recreate minutes. A tick lost *during the build* (a heavy C++
   build starving a recorder on the 2 GB VM) shows only as a recorder `missed tick` line and
   a monitor GAP line, not in the deploy's own count.
+
+## 12. Stage 2f: backup freshness check (2026-11-15)
+
+**Problem.** The VM can alert about its own failed backup passes, but not about being dead,
+and its key can't see object versions, so it can't notice an overwrite or a delete either.
+Both need an observer outside the VM with more read rights than the VM has.
+
+**What it is.** `ppm backup --status`, run on the laptop as the owner's SSO session
+(`AWS_PROFILE=ppm`). One paginated `ListObjectVersions` on `vm/` plus `GetBucketVersioning`,
+then a pure `audit()`:
+
+- **Freshness:** newest head by key name (`heads/NNNNNN.json`, zero-padded, so lexical =
+  numeric) whose latest entry is a real object; age = now − S3 `LastModified` (the head JSON
+  has no timestamp by design). Stale above **26 h** (one nightly head ~02:37Z + margin).
+- **Write-once held:** every key has exactly 1 version and 0 delete markers. Probe objects
+  are ordinary keys.
+- **Versioning still `Enabled`** (`GetBucketVersioning`; added after the diff review). With
+  versioning suspended an overwrite replaces the only version, so the count would still be
+  1 and prove nothing.
+- **Exit codes:** 0 ok; 1 problem (logged as `ALERT kind=backup-audit`, pushed to ntfy if
+  `PPM_NTFY_TOPIC` is set); 2 can't check (no bucket, missing profile, expired SSO, S3
+  error), printed only.
+
+```
+laptop (AWS_PROFILE=ppm) ──ListObjectVersions vm/──▶ S3 (versioned)
+  audit(versions, now) → 2 lines + PROBLEM lines → exit 0/1/2; on 1: log + ntfy
+```
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Separate `VersionLister` protocol + `S3VersionLister` (`backup/audit.py`) | Add `list_versions` to `ObjectStore` | The VM key is denied `ListBucketVersions`; the type shows which code needs owner credentials. Tests pass a plain list |
+| On demand only | Daily laptop launchd job; Lambda / read-only key now | SSO sessions expire within hours, so unattended laptop runs would mostly fail on credentials. An unattended checker needs an IAM change, so it's PLAN item 2g |
+| Age from S3 `LastModified` | Timestamp inside the head JSON | Heads stay deterministic (a rerun is byte-identical); S3's clock is independent of the VM's |
+
+**Measured (2026-11-15 09:33Z, live, owner SSO, read-only; final code):**
+
+```
+versioning: Enabled: OK
+newest head vm/heads/000012.json age 6.9 h (max 26 h): OK
+17 keys, 17 versions, 0 delete markers: OK
+backup status OK (1.4 s)
+```
+
+**1.4 s** inside the command (1.68 s wall); **head age 6.9 h**; exit 0. (The first run at
+09:29Z, before the versioning check, took 1.7 s / 2.15 s wall with an SSO token refresh.)
+Same counts as 2c2 (§10), so nothing changed in the bucket since. With a profile that
+doesn't exist: one `cannot check: ProfileNotFound …` line, exit 2.
+
+**What went wrong.** The first live "can't check" run (bad profile) crashed with a traceback
+and **exit 1**, which a script would read as "problem found". `boto3.client()` raises
+`ProfileNotFound` while *building* the client, which happened before the `try`. Fixed by
+building the lister inside the `try`; regression test added. Unit tests with a fake lister
+couldn't see this, since they never build a client.
+
+**Diff review (subagent):** no correctness gaps for the PLAN scenarios; 2 minor findings,
+both fixed:
+- *Suspended versioning would pass silently* (an overwrite replaces the single version). Owner
+  chose to add the `GetBucketVersioning` check; `audit()` takes the status as a required
+  keyword so no caller can skip it.
+- *A bulk overwrite would make one huge push* (ntfy turns > 4096 bytes into an attachment).
+  The alert now carries the count plus the first 3 problems; the terminal lists all.
+
+### Limits and open risks after 2f
+
+- **Nothing runs it on a schedule.** A dead VM is noticed only when the owner runs the check
+  (2g fixes this).
+- A **permanent** delete of a version (by version id; owner/root only) removes it from the
+  listing too, so 2f can't see it. It catches overwrites and plain deletes.
+- 26 h assumes one new head per night. A day with no new merged files would write no head;
+  recording all day always produces files, so a stale head still means "backup stopped".
