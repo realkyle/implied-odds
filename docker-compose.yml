@@ -77,15 +77,20 @@ services:
     <<: *ppm
     command: ["merge", "--loop"]
 
-  # Alerts when a venue goes silent or only fails; logs every missing tick. Reads the
-  # streams read-only (XREAD), never the writer's consumer group. Phone pushes need
-  # PPM_NTFY_TOPIC (from the shell or the git-ignored .env); without it, log only.
+  # Alerts when a venue goes silent or only fails, or the writer falls behind; logs every
+  # missing tick. Read-only: peeks at the streams (XREAD) and at the writer's consumer
+  # group state (XINFO/XPENDING), never reads through or acks for the group. Phone
+  # pushes need PPM_NTFY_TOPIC (from the shell or the git-ignored .env); without it,
+  # log only.
   monitor:
     <<: *ppm
     command: ["monitor"]
-    environment: # replaces the anchor's map (YAML merge is shallow), so repeat REDIS_URL
+    environment: # replaces the anchor's map (YAML merge is shallow), so repeat what it needs
       REDIS_URL: redis://redis:6379/0
       PPM_NTFY_TOPIC: ${PPM_NTFY_TOPIC:-}
+      # Same retention the recorders trim at, so `loss_in_s` and the threshold check are right.
+      PPM_STREAM_RETAIN_H: ${PPM_STREAM_RETAIN_H:-12}
+      PPM_MONITOR_WRITER_LAG_TICKS: ${PPM_MONITOR_WRITER_LAG_TICKS:-5}
 
   # Copies new merged files, the manifest and the chain head to S3, write-once (hourly
   # at :37). VM only: the `backup` profile is enabled by scripts/vm.sh, so a plain

@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 import pytest
-from ppm.monitor.watch import Failing, Gap, Recovered, Silent, VenueWatch, iso
+from ppm.monitor.watch import (
+    Backlog,
+    Failing,
+    Gap,
+    Recovered,
+    Silent,
+    VenueWatch,
+    WriterBehind,
+    WriterWatch,
+    iso,
+)
 from ppm.pipeline.clock import TICK_MS
 
 T0 = 1_794_500_000_000 - 1_794_500_000_000 % TICK_MS  # a minute tick
@@ -182,3 +192,75 @@ def test_error_ticks_separated_by_a_gap_are_not_in_a_row():
     events += feed(w, T0 + 5 * TICK_MS, ok=False)
     events += w.check(T0 + 6 * TICK_MS)
     assert [type(e).__name__ for e in events] == ["Gap"]  # streak restarted: 2, not 3
+
+
+# --- WriterWatch -------------------------------------------------------------------------
+
+LAG = 5 * TICK_MS  # the default threshold: 300 s
+RETAIN = 12 * HOUR
+
+
+def backlog(age_ms: int, now_ms: int = T0, pending: int = 0, undelivered: int | None = 6):
+    return Backlog("ppm:deribit", age_ms, pending, undelivered, now_ms)
+
+
+def test_writer_keeping_up_makes_no_events():
+    w = WriterWatch(LAG, RETAIN)
+    assert [e for age in (0, 800, 59_000, LAG - 1) for e in w.observe(backlog(age))] == []
+    assert not w.behind
+
+
+def test_writer_behind_alerts_once_at_the_threshold_with_time_to_loss():
+    w = WriterWatch(LAG, RETAIN)
+    assert w.observe(backlog(LAG, pending=20, undelivered=34)) == [
+        WriterBehind("ppm:deribit", LAG, 20, 34, loss_in_ms=RETAIN - LAG)
+    ]
+    # Still behind (and getting worse): no repeat, however long it lasts.
+    assert w.observe(backlog(LAG + 5_000, T0 + 5_000)) == []
+    assert w.observe(backlog(6 * HOUR, T0 + 6 * HOUR)) == []
+    assert w.behind
+
+
+def test_writer_recovers_once_with_how_long_it_was_behind():
+    w = WriterWatch(LAG, RETAIN)
+    w.observe(backlog(LAG + 2_000, now_ms=T0))  # oldest message arrived at T0 - LAG - 2 s
+    events = w.observe(backlog(400, now_ms=T0 + 10 * TICK_MS))
+    assert events == [Recovered("writer", "writer-lag", LAG + 2_000 + 10 * TICK_MS)]
+    assert w.observe(backlog(0, now_ms=T0 + 11 * TICK_MS)) == []
+    assert not w.behind
+
+
+def test_writer_can_fall_behind_again_after_recovering():
+    w = WriterWatch(LAG, RETAIN)
+    w.observe(backlog(LAG))
+    w.observe(backlog(0, T0 + TICK_MS))
+    assert len(w.observe(backlog(LAG, T0 + 20 * TICK_MS))) == 1
+
+
+def test_fresh_watch_alerts_at_once_when_the_writer_is_already_behind():
+    """A monitor restart during an outage re-alerts once (like silent venues)."""
+    assert len(WriterWatch(LAG, RETAIN).observe(backlog(3 * HOUR))) == 1
+
+
+def test_writer_behind_line_is_parseable_and_shows_unknown_lag():
+    line = WriterBehind("ppm:kalshi", 312_400, 0, None, loss_in_ms=RETAIN - 312_400).format()
+    assert line == (
+        "ALERT kind=writer-lag venue=writer stream=ppm:kalshi behind_s=312.4 pending=0 "
+        "undelivered=unknown loss_in_s=42887.6"
+    )
+    assert Recovered("writer", "writer-lag", 330_000).format() == (
+        "RECOVERED kind=writer-lag venue=writer down_for_s=330.0"
+    )
+
+
+@pytest.mark.parametrize("threshold, retain", [(0, RETAIN), (-1, RETAIN), (LAG, LAG)])
+def test_writer_watch_rejects_bad_thresholds(threshold, retain):
+    with pytest.raises(ValueError):
+        WriterWatch(threshold, retain)
+
+
+def test_time_to_loss_never_goes_negative_past_the_window():
+    """Trimming runs only on XADD, so with recorders also down a message can outlive the
+    window; the line then says 0, not a negative countdown."""
+    [alert] = WriterWatch(LAG, RETAIN).observe(backlog(RETAIN + HOUR))
+    assert alert.loss_in_ms == 0

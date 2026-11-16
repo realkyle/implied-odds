@@ -1,4 +1,5 @@
-"""Per-venue health state machine. Pure: no Redis, no clock, no I/O.
+"""Health state machines: `VenueWatch` per venue, `WriterWatch` for the writer (at the
+end of this file). Pure: no Redis, no clock, no I/O.
 
 `VenueWatch` is fed two things and answers with events:
 
@@ -107,6 +108,28 @@ class RedisUnreachable:
 
 
 @dataclass(frozen=True, slots=True)
+class WriterBehind:
+    """The writer hasn't finished a message that has been on `stream` for `behind_ms`.
+    Unfinished = never handed to the writer (`undelivered`) or handed over but never
+    acked (`pending`). `loss_in_ms` is how long until the recorders' trim deletes it."""
+
+    label: ClassVar[str] = "ALERT"
+    stream: str
+    behind_ms: int
+    pending: int
+    undelivered: int | None  # None: Redis couldn't compute the group's lag
+    loss_in_ms: int
+
+    def format(self) -> str:
+        undelivered = "unknown" if self.undelivered is None else self.undelivered
+        return (
+            f"ALERT kind=writer-lag venue=writer stream={self.stream} "
+            f"behind_s={_secs(self.behind_ms)} pending={self.pending} "
+            f"undelivered={undelivered} loss_in_s={_secs(self.loss_in_ms)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeAlert:
     """Sent by `ppm monitor --test-notify` to prove notifications get delivered."""
 
@@ -156,8 +179,76 @@ class BackupAudit:
 
 
 Event = (
-    Gap | Silent | Failing | RedisUnreachable | ProbeAlert | BackupFailed | BackupAudit | Recovered
+    Gap
+    | Silent
+    | Failing
+    | RedisUnreachable
+    | WriterBehind
+    | ProbeAlert
+    | BackupFailed
+    | BackupAudit
+    | Recovered
 )
+
+
+@dataclass(frozen=True, slots=True)
+class Backlog:
+    """The writer's worst backlog across the streams, read from its consumer group.
+
+    `age_ms` is how long the oldest unfinished message on `stream` has waited (0 when the
+    writer is caught up). It and `now_ms` are on Redis's clock: stream IDs are stamped by
+    Redis, and comparing them with Redis `TIME` keeps host clock drift out of the answer.
+    """
+
+    stream: str
+    age_ms: int
+    pending: int
+    undelivered: int | None
+    now_ms: int
+
+
+class WriterWatch:
+    """Is the writer keeping up? Fed one `Backlog` per check, answers with events.
+
+    Edge-triggered like `VenueWatch`'s silence: one `WriterBehind` when the oldest
+    unfinished message gets `threshold_ms` old, then one `Recovered(kind="writer-lag")`
+    once it is younger again. No hysteresis: the writer works oldest-first, so after it
+    resumes the age only falls. Not fed while Redis is unreachable, so nothing changes
+    then (the Redis alert covers that time).
+    """
+
+    def __init__(self, threshold_ms: int, retain_ms: int) -> None:
+        if threshold_ms <= 0 or retain_ms <= threshold_ms:
+            raise ValueError("writer-lag threshold must be positive and below the retention")
+        self.threshold_ms = threshold_ms
+        self.retain_ms = retain_ms
+        self._behind_since: int | None = None  # arrival of the oldest message when alerted
+
+    @property
+    def behind(self) -> bool:
+        return self._behind_since is not None
+
+    def observe(self, backlog: Backlog) -> list[Event]:
+        if backlog.age_ms >= self.threshold_ms:
+            if self._behind_since is not None:
+                return []
+            self._behind_since = backlog.now_ms - backlog.age_ms
+            return [
+                WriterBehind(
+                    backlog.stream,
+                    backlog.age_ms,
+                    backlog.pending,
+                    backlog.undelivered,
+                    # 0, not negative, once past the window (e.g. the recorders were
+                    # down too, so nothing trimmed it yet): loss is due or done.
+                    loss_in_ms=max(0, self.retain_ms - backlog.age_ms),
+                )
+            ]
+        if self._behind_since is None:
+            return []
+        down_for = backlog.now_ms - self._behind_since
+        self._behind_since = None
+        return [Recovered("writer", "writer-lag", down_for)]
 
 
 class VenueWatch:
