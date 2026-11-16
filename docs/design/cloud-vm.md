@@ -670,3 +670,46 @@ burst), but the backup had nothing new, and the 2f check would have reported the
 stale at about 04:37Z. The backup uploaded head seq=25 at 04:37:11Z (13 files,
 517.4 MB, 11.0 s). Neither alert covers this: the writer was fine, and there is no
 "merge overdue" alarm. Only the head age (2f, 26 h) would have caught it. Fix: PLAN 2h.
+
+## 14. Stage 2h: the merger waits out the tick burst (2026-11-16)
+
+**Problem** (see §13): `ppm merge --loop` took one `XINFO GROUPS` snapshot at :07:00 and
+merged only if every stream showed `pending 0` and `lag 0`. The minute recorders publish
+in the first ~0.7 s of every minute, so a check at :07:00.3 always saw messages in
+flight, even with a healthy writer, and the VM skipped 2026-11-15 three hours in a row.
+
+**Options considered:**
+
+| Option | Verdict |
+|---|---|
+| A. Re-check every 1 s for up to 60 s; merge on the first drained snapshot | **Chosen.** Same meaning of "drained", only the moment of looking changes; doesn't depend on publish timing |
+| B. Check once at :07:30 instead | Rejected: bets that nothing publishes at :30 (settlements ~:00:15, Polymarket discovery, spool replays) |
+| C. Drained = no unfinished message older than ~30 s (2d2's age signal), or no stream ID before day end | Rejected: days are assigned by *tick* time, so a late replay of day D has a young stream ID and would be merged past |
+
+Plus a cheap **merge-overdue** line: whenever an hourly run ends with a due day still
+unmerged (queue busy for the whole 60 s, Redis error, or a merge that raises), the merger
+logs `ALERT kind=merge-overdue day=D hours_late=N` (WARNING) for each such day ≥ 2 h past
+its D+1 02:00 grace, i.e. from the 04:07 check on. It is log-only (the merger has no
+notifier, and ntfy is off on the VM), so someone has to read `vm.sh logs merger`; the 2f
+head-age check (26 h) stays the backstop. The first version alerted only on the "busy
+queue" path; the review showed a Redis error or a failing merge would end every hour as
+just `merge failed`, so the check moved after the error handling.
+
+**Code:** `wait_until_drained` (`pipeline/bus.py`), `_merge_hour` /
+`_merge_when_drained` / `_flag_overdue` (`cli.py`, constants `DRAIN_WINDOW_MS` = 60 s, `DRAIN_POLL_MS` = 1 s,
+`MERGE_OVERDUE_MS` = 2 h), `overdue_ms` (`writer/merge.py`). The merger logs
+`queue drained after X.X s; merging [...]`, which is the measured start delay.
+
+**Failure test:** a message is left pending (handed to the writer, not acked) and acked
+300 ms later. `wait_until_drained` returns ~300 ms. With the loop cut back to a single
+snapshot (mutation), this test and the loop-level one fail.
+
+A shutdown (`stop` set) during or right at the end of the wait starts no merge: a merge
+takes ~150 s on the VM and Docker kills the container 30 s after SIGTERM.
+
+**Known limits:** a restart in the last minute of an hour can make its start-up run
+(with a full 60 s wait) push the next check one hour later; the wait uses the wall clock,
+so an NTP step during it stretches or shortens the 60 s. Both are harmless at hourly
+granularity.
+
+**Live result:** pending the first night after deploy (2026-11-17 ~02:07Z).

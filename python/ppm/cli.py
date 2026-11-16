@@ -45,7 +45,7 @@ from ppm.integrity.manifest import Manifest
 from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
 from ppm.monitor.service import Monitor, build_watches
 from ppm.monitor.watch import BackupAudit, BackupFailed, ProbeAlert, Recovered, WriterWatch
-from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
+from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, wait_until_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
 from ppm.recorders.deribit import DeribitRecorder
@@ -53,7 +53,7 @@ from ppm.recorders.kalshi import KalshiRecorder
 from ppm.recorders.polymarket import PolymarketRecorder
 from ppm.recorders.reference import ReferenceRecorder
 from ppm.recorders.settlements import SettlementRecorder
-from ppm.writer.merge import DailyMerger
+from ppm.writer.merge import DailyMerger, overdue_ms
 from ppm.writer.storage import DataStore
 from ppm.writer.writer import Writer
 
@@ -112,6 +112,13 @@ async def _write(settings: Settings) -> None:
 MERGE_EVERY_MS = 3_600_000
 # Run a few minutes past the hour, away from the busiest moment (every recorder at :00).
 MERGE_OFFSET_MS = 7 * 60_000
+# A single queue check at :07:00 lands in the minute's publish burst (0.2-0.7 s on the VM)
+# and sees a busy queue (2026-11-16, PLAN 2h). Re-check every second for up to a minute;
+# a writer that keeps up is seen drained within a second or two.
+DRAIN_WINDOW_MS = 60_000
+DRAIN_POLL_MS = 1_000
+# Two skipped hourly checks past the 02:00 grace (i.e. from the 04:07 check on).
+MERGE_OVERDUE_MS = 2 * 3_600_000
 
 
 async def _merge(settings: Settings, day: str | None, loop: bool) -> None:
@@ -129,18 +136,63 @@ async def _merge(settings: Settings, day: str | None, loop: bool) -> None:
     run_at = floor_tick(now_ms(), MERGE_EVERY_MS) + MERGE_OFFSET_MS  # also once at start
     while not stop.is_set():
         if now_ms() >= run_at:
-            try:
-                due = merger.pending_days(now_ms())
-                if due and not await queue_drained(redis, sorted(RECORDERS)):
-                    log.info("days %s due, but the writer still has queued messages", due)
-                elif due:
-                    for report in merger.merge_due(now_ms()):
-                        log.info("merged %s: %s", report.day, _merge_summary(report))
-            except Exception:  # one failed merge must not kill the service; retry next hour
-                log.exception("merge failed")
+            await _merge_hour(merger, redis, stop, log)
             run_at = next_tick(now_ms(), MERGE_EVERY_MS) + MERGE_OFFSET_MS
         await sleep_until(min(run_at, now_ms() + 60_000), stop)
     await redis.aclose()
+
+
+async def _merge_hour(
+    merger: DailyMerger, redis: Redis, stop: asyncio.Event, log: logging.Logger
+) -> None:
+    """One hourly run of the merge loop: merge the due days if the queue drains, and
+    whatever stopped them (busy queue, Redis down, a failing merge), flag any day still
+    unmerged MERGE_OVERDUE_MS past its grace."""
+    due: list[str] = []
+    try:
+        due = merger.pending_days(now_ms())
+        if due:
+            await _merge_when_drained(merger, redis, due, stop, log)
+    except Exception:  # one failed merge must not kill the service; retry next hour
+        log.exception("merge failed")
+    if due and not stop.is_set():
+        _flag_overdue(merger, due, log)
+
+
+async def _merge_when_drained(
+    merger: DailyMerger, redis: Redis, due: list[str], stop: asyncio.Event, log: logging.Logger
+) -> None:
+    """Merge the due days once the writer's queue is seen empty within DRAIN_WINDOW_MS;
+    otherwise skip this hour (the caller flags overdue days)."""
+    waited = await wait_until_drained(
+        redis, sorted(RECORDERS), window_ms=DRAIN_WINDOW_MS, every_ms=DRAIN_POLL_MS, stop=stop
+    )
+    if stop.is_set():  # shutting down: don't start a ~150 s merge Docker would SIGKILL
+        return
+    if waited is None:
+        log.info(
+            "days %s due, but the writer still had queued messages for %d s",
+            due,
+            DRAIN_WINDOW_MS // 1000,
+        )
+        return
+    log.info("queue drained after %.1f s; merging %s", waited / 1000, due)
+    for report in merger.merge_due(now_ms()):
+        log.info("merged %s: %s", report.day, _merge_summary(report))
+
+
+def _flag_overdue(merger: DailyMerger, due: list[str], log: logging.Logger) -> None:
+    """Log `ALERT kind=merge-overdue` for each day still unmerged MERGE_OVERDUE_MS past its
+    grace. Log-only: the merger has no notifier (see PLAN 2h)."""
+    now = now_ms()
+    try:
+        still = merger.pending_days(now)
+    except Exception:  # can't list the days (e.g. disk trouble): judge the ones we had
+        still = due
+    for day in still:
+        late = overdue_ms(day, now)
+        if late >= MERGE_OVERDUE_MS:
+            log.warning("ALERT kind=merge-overdue day=%s hours_late=%.1f", day, late / 3.6e6)
 
 
 def _merge_summary(report) -> str:
