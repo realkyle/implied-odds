@@ -647,3 +647,26 @@ the moment the writer dies, add up to one tick (0–60 s) until a message is wai
 - Smaller review fixes: `loss_in_s` is clamped at 0, and a backward host-clock step no
   longer stalls the throttled check.
 
+
+### First night on the VM (2026-11-16)
+
+Deployed from main (`25e9504`) at 00:31Z. Between then and 04:20Z,
+`scripts/vm.sh logs monitor | grep -E "writer-lag|ALERT"` printed **0 lines** (no
+`GAP` lines either). That window includes the night's only merge.
+
+**Caveat: the merge did not run at 02:00.** The merger skipped 2026-11-15 at 02:07, 03:07
+and 04:07 (see below), and the day was merged by hand at 04:15:55Z (**150.7 s**, against
+147.8 s for 2026-11-14). The writer-lag alert stayed silent through that merge too, so
+merge load did not push the oldest unfinished message anywhere near 300 s. The test
+that the 02:00 window is quiet repeats once PLAN 2h lets the merge start on time.
+
+**Found the same night: the merger skipped a drained queue.** `ppm merge --loop` checks
+`queue_drained` once at :07:00. The four minute recorders publish between :00.21 and
+:00.72 of every minute (stream IDs at 02:07, 03:07 and 04:07), and the checks ran at
+:00.36, :00.39 and :00.28, inside that burst. So the check saw a momentary `lag > 0`
+and waited a whole hour, three times. On 2026-11-15 it had checked at about :01.6 and
+merged. Nothing was lost (the writer was healthy, `pending 0 lag 0` outside the
+burst), but the backup had nothing new, and the 2f check would have reported the head
+stale at about 04:37Z. The backup uploaded head seq=25 at 04:37:11Z (13 files,
+517.4 MB, 11.0 s). Neither alert covers this: the writer was fine, and there is no
+"merge overdue" alarm. Only the head age (2f, 26 h) would have caught it. Fix: PLAN 2h.

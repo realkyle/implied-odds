@@ -21,8 +21,10 @@ from ppm.analysis.coverage import (
     day_start_ms,
     expected_ticks,
     load_store,
+    page_group,
     pinned_entries,
     render,
+    to_json,
 )
 from ppm.integrity.manifest import Manifest
 
@@ -421,3 +423,95 @@ def test_candidate_with_fewer_rows_needs_a_cause_but_more_rows_does_not(tmp_path
     assert r.unexplained() == 1
     assert r.problems() == []
     assert "needs a cause: polymarket_books 00:00 laptop 11 rows, vm 10" in render(r)
+
+
+def _pages(t: int, series: str, n: int, status: str = "200", start: int = 0) -> list[dict]:
+    return [
+        _fetch(t, "settlements", f"kalshi_settled-{i:02d}-{series}", status)
+        for i in range(start, start + n)
+    ]
+
+
+def test_fewer_pages_of_a_fetched_series_needs_a_cause_not_a_fail(tmp_path):
+    """2026-11-15 02:00: the laptop fetched late (after sleep) and needed one more page
+    of settled markets; the VM fetched the same series on time in fewer pages."""
+    t = T0 + 2 * HOUR
+    r = report_for(tmp_path, base={"fetch_rows": [*fetches(), *_pages(t, "KXBTC", 1, start=1)]})
+    assert r.problems() == []
+    assert [(p.tick, p.series, p.baseline_pages, p.candidate_pages) for p in r.page_shortfalls] == [
+        (t, "kalshi_settled-KXBTC", 2, 1)
+    ]
+    assert r.unexplained() == 1
+    assert "needs a cause: settlements 02:00 kalshi_settled-KXBTC: laptop 2 pages, vm 1" in render(
+        r
+    )
+
+
+def test_cut_off_pagination_is_one_item_showing_both_page_counts(tmp_path):
+    """Review: losing 9 pages must not read like the usual 'one page fewer'."""
+    t = T0 + 2 * HOUR
+    r = report_for(tmp_path, base={"fetch_rows": [*fetches(), *_pages(t, "KXBTC", 9, start=1)]})
+    assert r.problems() == []
+    assert r.unexplained() == 1
+    assert "laptop 10 pages, vm 1" in render(r)
+    out = to_json(r)["fewer_pages"]
+    assert out == [
+        {
+            "venue": "settlements",
+            "tick": "2026-11-15T02:00:00Z",
+            "series": "kalshi_settled-KXBTC",
+            "baseline_pages": 10,
+            "candidate_pages": 1,
+            "candidate_tick_ok": True,
+        }
+    ]
+
+
+def test_candidate_missing_every_page_of_a_series_still_fails(tmp_path):
+    t = T0 + 2 * HOUR
+    skip = {("settlements", t, "kalshi_settled-00-KXBTC")}
+    other = _pages(t, "KXETH", 1)
+    r = report_for(
+        tmp_path,
+        base={"fetch_rows": [*fetches(), *other]},
+        cand={"fetch_rows": [*fetches(skip_key=skip), *other]},
+    )
+    assert r.page_shortfalls == ()
+    assert r.problems() == ["settlements: vm lacks kalshi_settled-00-KXBTC at 1 shared tick(s)"]
+
+
+def test_series_whose_only_candidate_page_failed_still_fails(tmp_path):
+    """Review: a 500 on page 00 (then the recorder stops) is not 'fewer pages'."""
+    t = T0 + 2 * HOUR
+    skip = {("settlements", t, "kalshi_settled-00-KXBTC")}
+    r = report_for(
+        tmp_path,
+        base={"fetch_rows": [*fetches(), *_pages(t, "KXBTC", 1, start=1)]},
+        cand={"fetch_rows": [*fetches(skip_key=skip), *_pages(t, "KXBTC", 1, "500")]},
+    )
+    assert r.page_shortfalls == ()
+    assert r.problems()[-1] == "settlements: vm lacks kalshi_settled-01-KXBTC at 1 shared tick(s)"
+
+
+def test_shortfall_on_an_error_tick_is_not_counted_twice(tmp_path):
+    """Page 00 ok, page 01 failed, recorder stopped: the error tick already needs a cause."""
+    t = T0 + 2 * HOUR
+    r = report_for(
+        tmp_path,
+        base={"fetch_rows": [*fetches(), *_pages(t, "KXBTC", 2, start=1)]},
+        cand={"fetch_rows": [*fetches(), *_pages(t, "KXBTC", 1, "500", start=1)]},
+    )
+    assert [
+        (p.baseline_pages, p.candidate_pages, p.candidate_tick_ok) for p in r.page_shortfalls
+    ] == [(3, 2, False)]
+    assert r.coverage["vm"]["settlements"].error == 1
+    assert r.unexplained() == 1
+    assert "(vm tick is an error)" in render(r)
+
+
+def test_page_group_only_strips_pages_of_paged_endpoints():
+    assert page_group("settlements", "kalshi_settled-14-KXETHD") == "kalshi_settled-KXETHD"
+    assert page_group("settlements", "kalshi_settled-03-KX-ETH_2") == "kalshi_settled-KX-ETH_2"
+    assert page_group("kalshi", "markets-KXBTC") is None
+    assert page_group("settlements", "polymarket_resolved") is None
+    assert page_group("deribit", "book_summary-BTC-option") is None

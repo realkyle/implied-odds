@@ -25,6 +25,8 @@ and day, the same "latest part wins" rule the merge uses):
 The pass bar (owner decision 2026-11-15) is partly human: code checks that the
 candidate's ok count is ≥ the baseline's for every venue and that settlements match;
 every candidate tick that isn't ok is *listed*, and a person writes its cause down.
+So is a tick where the candidate fetched fewer pages of a paged endpoint
+(`PAGED_ENDPOINTS`): a late fetch sees more results, so page counts legitimately vary.
 """
 
 from __future__ import annotations
@@ -73,6 +75,12 @@ TABLE_VENUE = {
     "reference_prices": "reference",
 }
 DAY_MS = 86_400_000
+# Endpoints that page through results. Their key is "<endpoint>-<page NN>-<series>"
+# (`Envelope.key` joins params sorted by name: page before series). How many pages a
+# fetch needs depends on how many results exist *when* it runs, so a late fetch of the
+# same tick can need one more page. 2026-11-15 02:00: the laptop woke from battery sleep
+# and fetched at 02:22 (15 pages of settled KXETH), the VM on time (14 pages).
+PAGED_ENDPOINTS = frozenset({("settlements", "kalshi_settled")})
 
 
 class CoverageError(Exception):
@@ -255,12 +263,34 @@ def discovery_max_gap_ms(snap: StoreSnapshot) -> int | None:
     return max(b - a for a, b in zip(edges, edges[1:], strict=False))
 
 
+def page_group(venue: str, key: str) -> str | None:
+    """`key` without its page number ("kalshi_settled-KXETH"), or None if not paged."""
+    endpoint, _, rest = key.partition("-")
+    page, _, series = rest.partition("-")
+    if (venue, endpoint) not in PAGED_ENDPOINTS or not page.isdigit():
+        return None
+    return f"{endpoint}-{series}"
+
+
 @dataclass(frozen=True, slots=True)
 class EndpointDiff:
     venue: str
     tick: int
     endpoint_key: str
     only_in: str  # label of the store that has it
+
+
+@dataclass(frozen=True, slots=True)
+class PageShortfall:
+    """At one tick the candidate fetched fewer pages of a paged series than the baseline,
+    but at least one page of it without error (otherwise it's a missing endpoint)."""
+
+    venue: str
+    tick: int
+    series: str  # page_group(): "kalshi_settled-KXETH"
+    baseline_pages: int
+    candidate_pages: int
+    candidate_tick_ok: bool  # if not, the tick is already counted as an error
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,21 +320,30 @@ class CoverageReport:
     settlements: SettlementDiff
     # (venue, endpoint_key) -> label -> ticks it was fetched in (discovery aside)
     presence: Mapping[tuple[str, str], Mapping[str, int]]
+    # Paged series the candidate fetched in fewer pages (their baseline-only page keys
+    # are still listed in `endpoint_diffs`, but don't FAIL).
+    page_shortfalls: tuple[PageShortfall, ...] = ()
 
     def problems(self) -> list[str]:
         """The parts of the pass bar code can decide. Empty = those parts pass.
 
         "ok" only means a tick was fetched without errors, so the cross-store checks
         are what catch a candidate that systematically skips an endpoint (owner
-        decision 2026-11-15, after review).
+        decision 2026-11-15, after review). A missing *page* of a series the candidate
+        fetched is not a skipped endpoint: it needs a stated cause instead (owner
+        decision 2026-11-16, `page_shortfalls`).
         """
         out = []
         for venue, base in self.coverage[self.baseline].items():
             cand = self.coverage[self.candidate][venue]
             if cand.ok < base.ok:
                 out.append(f"{venue}: {self.candidate} ok {cand.ok} < {self.baseline} ok {base.ok}")
+        short = {(p.venue, p.tick, p.series) for p in self.page_shortfalls}
         lacking = Counter(
-            (d.venue, d.endpoint_key) for d in self.endpoint_diffs if d.only_in == self.baseline
+            (d.venue, d.endpoint_key)
+            for d in self.endpoint_diffs
+            if d.only_in == self.baseline
+            and (d.venue, d.tick, page_group(d.venue, d.endpoint_key)) not in short
         )
         for (venue, key), n in sorted(lacking.items()):
             out.append(f"{venue}: {self.candidate} lacks {key} at {n} shared tick(s)")
@@ -317,9 +356,12 @@ class CoverageReport:
         return [(c.table, t, a, b) for c in self.counts for t, a, b in c.differing if b < a]
 
     def unexplained(self) -> int:
-        """Candidate ticks that need a cause written down by a person: not ok, or fewer rows."""
+        """Items a person must write a cause for: candidate ticks not ok, ticks with
+        fewer rows, and (tick, series) pairs with fewer pages on an otherwise ok tick
+        (a not-ok tick is already counted once)."""
         not_ok = sum(c.error + c.missing for c in self.coverage[self.candidate].values())
-        return not_ok + len(self.fewer_rows())
+        pages = sum(p.candidate_tick_ok for p in self.page_shortfalls)
+        return not_ok + len(self.fewer_rows()) + pages
 
 
 def compare(baseline: StoreSnapshot, candidate: StoreSnapshot) -> CoverageReport:
@@ -334,6 +376,28 @@ def compare(baseline: StoreSnapshot, candidate: StoreSnapshot) -> CoverageReport
         b = set(candidate.fetches[(venue, tick)]) - {DISCOVERY[1]}
         diffs += [EndpointDiff(venue, tick, k, baseline.label) for k in sorted(a - b)]
         diffs += [EndpointDiff(venue, tick, k, candidate.label) for k in sorted(b - a)]
+    shortfalls = []
+    for venue, tick, group in sorted(
+        {
+            (d.venue, d.tick, g)
+            for d in diffs
+            if d.only_in == baseline.label and (g := page_group(d.venue, d.endpoint_key))
+        }
+    ):
+        base = baseline.fetches[(venue, tick)]
+        cand = candidate.fetches[(venue, tick)]
+        cand_ok_pages = [k for k, ok in cand.items() if ok and page_group(venue, k) == group]
+        if cand_ok_pages:  # no ok page of the series at all -> stays a missing endpoint
+            shortfalls.append(
+                PageShortfall(
+                    venue,
+                    tick,
+                    group,
+                    baseline_pages=sum(page_group(venue, k) == group for k in base),
+                    candidate_pages=sum(page_group(venue, k) == group for k in cand),
+                    candidate_tick_ok=all(cand.values()),
+                )
+            )
 
     counts = []
     for table in TICK_TABLES:
@@ -368,6 +432,7 @@ def compare(baseline: StoreSnapshot, candidate: StoreSnapshot) -> CoverageReport
         counts=tuple(counts),
         settlements=settlements,
         presence=_presence(snaps),
+        page_shortfalls=tuple(shortfalls),
     )
 
 
@@ -473,10 +538,16 @@ def render(report: CoverageReport, shown: int = 10) -> str:
         lines.append(
             f"needs a cause: {table} {_hhmm(t)} {report.baseline} {a} rows, {report.candidate} {b}"
         )
+    for p in report.page_shortfalls[:shown]:
+        lines.append(
+            f"needs a cause: {p.venue} {_hhmm(p.tick)} {p.series}: {report.baseline} "
+            f"{p.baseline_pages} pages, {report.candidate} {p.candidate_pages}"
+            + ("" if p.candidate_tick_ok else f" ({report.candidate} tick is an error)")
+        )
     lines.append(
         f"{'FAIL' if problems else 'PASS (automatic part)'}; "
-        f"{report.unexplained()} {report.candidate} tick(s) not ok or with fewer rows, "
-        "each needs a stated cause"
+        f"{report.unexplained()} {report.candidate} item(s) "
+        "(ticks not ok, fewer rows or fewer pages), each needs a stated cause"
     )
     return "\n".join(lines)
 
@@ -522,6 +593,17 @@ def to_json(report: CoverageReport) -> dict:
         "problems": report.problems(),
         "candidate_ticks_needing_a_cause": report.unexplained(),
         "fewer_rows": [[t, iso(tick), a, b] for t, tick, a, b in report.fewer_rows()],
+        "fewer_pages": [
+            {
+                "venue": p.venue,
+                "tick": iso(p.tick),
+                "series": p.series,
+                "baseline_pages": p.baseline_pages,
+                "candidate_pages": p.candidate_pages,
+                "candidate_tick_ok": p.candidate_tick_ok,
+            }
+            for p in report.page_shortfalls
+        ],
         "endpoint_presence": {
             f"{venue} {key}": dict(c) for (venue, key), c in report.presence.items()
         },
