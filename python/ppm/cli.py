@@ -35,7 +35,7 @@ from ppm.faulttest.runner import main as faulttest_main
 from ppm.integrity.manifest import Manifest
 from ppm.monitor.notify import FanoutNotifier, LogNotifier, Notifier, NtfyNotifier
 from ppm.monitor.service import Monitor, build_watches
-from ppm.monitor.watch import BackupAudit, BackupFailed, ProbeAlert, Recovered
+from ppm.monitor.watch import BackupAudit, BackupFailed, ProbeAlert, Recovered, WriterWatch
 from ppm.pipeline.bus import DiskSpool, RedisBus, StreamConsumer, queue_drained
 from ppm.pipeline.clock import floor_tick, next_tick, now_ms, sleep_until
 from ppm.recorders.base import Recorder
@@ -173,13 +173,31 @@ async def _monitor(settings: Settings, test_notify: bool) -> int:
             settings.monitor_failing_ticks,
             now_ms(),
         )
+        # The writer reads every recorder's stream, whatever PPM_MONITOR_VENUES says. One
+        # global threshold, in ticks of the fastest venue (the writer is one process).
+        writer_venues = sorted(RECORDERS)
+        fastest_tick_ms = min(RECORDERS[v].tick_ms for v in writer_venues)
+        try:
+            writer_watch = WriterWatch(
+                int(settings.monitor_writer_lag_ticks * fastest_tick_ms),
+                settings.stream_retain_ms,
+            )
+        except ValueError as exc:
+            print(f"PPM_MONITOR_WRITER_LAG_TICKS: {exc}", file=sys.stderr)
+            return 2
         logging.getLogger("ppm.monitor").info(
-            "thresholds: silent after %.1f ticks, failing after %d ticks, ntfy %s",
+            "thresholds: silent after %.1f ticks, failing after %d ticks, "
+            "writer lag after %.0f s (retention %.0f s), ntfy %s",
             settings.monitor_silent_ticks,
             settings.monitor_failing_ticks,
+            writer_watch.threshold_ms / 1000,
+            writer_watch.retain_ms / 1000,
             "on" if ntfy else "off",
         )
-        await Monitor(redis, watches, notifier).run_forever(stop)
+        monitor = Monitor(
+            redis, watches, notifier, writer_watch=writer_watch, writer_venues=writer_venues
+        )
+        await monitor.run_forever(stop)
         await redis.aclose()
     return 0
 

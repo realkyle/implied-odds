@@ -220,7 +220,7 @@ Redis ALERT 64.3 s vs 64.6 s; `failing` ALERT 231.4 s vs 231.5 s).
 
 ### Open risks after 2b
 
-- **A dead writer isn't alerted, and the loss would be silent.** `ppm monitor` watches
+- *(Closed 2026-11-15 by 2d2, §13.)* **A dead writer isn't alerted, and the loss would be silent.** `ppm monitor` watches
   venue streams, not the writer. After 12 h, messages the writer never received are trimmed
   with no `DATA LOSS` line (that line covers only delivered-but-unacked ones). A writer-lag
   alert is designed (`recorder-pipeline.md` §5) but not built. It should exist before the
@@ -594,3 +594,56 @@ both fixed:
   listing too, so 2f can't see it. It catches overwrites and plain deletes.
 - 26 h assumes one new head per night. A day with no new merged files would write no head;
   recording all day always produces files, so a stale head still means "backup stopped".
+
+## 13. Stage 2d2: writer-lag alert (2026-11-15)
+
+**Problem.** §8's open risk: `ppm monitor` only peeked at the venue streams, so a dead,
+hung, crash-looping or stuck-retrying writer looked healthy, and after the 12 h trim the
+unread messages vanished with no log line. 2f's head age would notice only after ~26 h.
+Done = one ALERT when the writer falls behind and one RECOVERED when it catches up,
+before 2d3 makes the VM canonical.
+
+**Design** (full version: `recorder-pipeline.md` §11). Every ≥ 5 s the monitor reads the
+writer's consumer-group state, read-only. The signal is the **age of the oldest
+unfinished message**: per stream, the older of the oldest pending message (`XPENDING`)
+and the first undelivered one (after `last-delivered-id`). Its age is Redis `TIME`
+minus the ID's milliseconds, both on Redis's own clock. One global threshold:
+`PPM_MONITOR_WRITER_LAG_TICKS` = 5 minute ticks = **300 s**, which is 0.7 % of the
+retention and leaves 11 h 55 m to react.
+
+```text
+ALERT kind=writer-lag venue=writer stream=ppm:kalshi behind_s=305.7 pending=0 undelivered=24 loss_in_s=42894.3
+RECOVERED kind=writer-lag venue=writer down_for_s=380.6
+```
+
+Rejected: message counts (they need per-venue tuning and don't relate to the
+retention); a heartbeat (it shows liveness, not progress, and the disk-full retry loop
+keeps beating); staging mtime.
+
+### Results (laptop, isolated `ppmtest` stack, 2026-11-15/16)
+
+| Check | Result |
+|---|---|
+| Healthy writer, sampled every 0.25 s for 5.5 min | 1287 samples: p50 = p99 = **0 ms**, max **250 ms** (1200× below the threshold); 0 `writer-lag` lines |
+| `pause writer` (cgroup freeze = hung) at 23:51:10Z | ALERT 23:57:11Z, **305.7 s after the first unprocessed message** (361.1 s after the pause; the pause was 50 s before the next tick). RECOVERED **14.2 s** after unpause, `down_for_s=380.6` |
+| `stop writer` (dead) at 23:59:11Z | ALERT **306.0 s** after the first unprocessed message (360.5 s after the stop). RECOVERED **8.7 s** after start, `down_for_s=375.7` |
+| `pause writer` again on the **review-fixed** monitor, 00:08:10Z | ALERT **305.7 s** after the first unprocessed message (361.0 s after the pause); RECOVERED **14.7 s** after unpause, `down_for_s=380.9`; no other ALERT/GAP lines |
+| After the faults | every stream `pending 0 lag 0`, 0 `DATA LOSS` lines: nothing lost |
+
+**Detection latency:** threshold + 5.7–6.0 s. The check runs at most every 5 s and the
+loop can also wait in a 5 s `XREAD`, so the worst case is about threshold + 10 s. From
+the moment the writer dies, add up to one tick (0–60 s) until a message is waiting.
+
+### What went wrong
+
+- **Review found a lost-alert bug.** The first version judged the backlog before the
+  `XREAD` (so a Redis drop couldn't discard messages already read). But if the `XREAD`
+  then failed, the watch was already "behind" and its ALERT was thrown away, so it
+  would never be sent. Now the backlog is fetched before the `XREAD` and judged after
+  it. A regression test fails on the old order.
+- **The monitor never got `PPM_STREAM_RETAIN_H`.** Its `environment:` map replaces the
+  anchor's map (shallow YAML merge), so a changed retention would have given a wrong
+  `loss_in_s`. Now both variables are passed.
+- Smaller review fixes: `loss_in_s` is clamped at 0, and a backward host-clock step no
+  longer stalls the throttled check.
+

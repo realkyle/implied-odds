@@ -22,6 +22,10 @@ class Settings:
     # many ticks in a row with only error messages. Optional ntfy.sh topic for pushes.
     monitor_silent_ticks: float = 2.5
     monitor_failing_ticks: int = 3
+    # Writer-lag alert: when the oldest message the writer hasn't finished is this many
+    # minute ticks old. 5 (300 s) clears a deploy (≤15 s down) and a whole VM merge (148 s)
+    # and is 0.7 % of the 12 h retention, after which unread messages are trimmed (lost).
+    monitor_writer_lag_ticks: float = 5.0
     ntfy_topic: str | None = None
     monitor_venues: tuple[str, ...] | None = None  # None: every recorder
     # Off-machine backup (S3). The bucket name comes from `terraform output backup_bucket`.
@@ -43,6 +47,7 @@ class Settings:
             stream_retain_ms=_hours_to_ms(os.environ.get("PPM_STREAM_RETAIN_H", "12")),
             monitor_silent_ticks=float(os.environ.get("PPM_MONITOR_SILENT_TICKS", "2.5")),
             monitor_failing_ticks=int(os.environ.get("PPM_MONITOR_FAILING_TICKS", "3")),
+            monitor_writer_lag_ticks=float(os.environ.get("PPM_MONITOR_WRITER_LAG_TICKS", "5")),
             ntfy_topic=os.environ.get("PPM_NTFY_TOPIC") or None,
             monitor_venues=_csv(os.environ.get("PPM_MONITOR_VENUES")),
             backup_bucket=os.environ.get("PPM_BACKUP_BUCKET") or None,

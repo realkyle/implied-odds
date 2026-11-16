@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from ppm.monitor.service import Monitor, build_watches, header
-from ppm.monitor.watch import Gap, Recovered, RedisUnreachable, Silent
+from ppm.monitor import service
+from ppm.monitor.service import Monitor, build_watches, header, writer_backlog
+from ppm.monitor.watch import Gap, Recovered, RedisUnreachable, Silent, WriterBehind, WriterWatch
 from ppm.pipeline.bus import StreamConsumer, stream_name
 from ppm.pipeline.clock import TICK_MS
 from ppm.tests.conftest import make_envelope
@@ -235,3 +236,223 @@ async def test_a_raising_notifier_does_not_stop_the_loop(redis):
     stop.set()
     await asyncio.wait_for(task, 2)
     assert Boom.calls == 2  # both alerts attempted although the first raised
+
+
+# --- Writer lag ----------------------------------------------------------------------------
+# fakeredis's TIME is the real clock, so these tests stamp message IDs relative to it and
+# allow a little slack for the time the test itself takes.
+
+LAG = 5 * TICK_MS
+SLACK = 2_000
+
+
+async def redis_now(redis) -> int:
+    seconds, micros = await redis.time()
+    return seconds * 1000 + micros // 1000
+
+
+async def add_aged(redis, venue: str, age_ms: int, now: int) -> str:
+    """XADD with an ID stamped `age_ms` before `now`, as if Redis had added it then."""
+    env = make_envelope(venue=venue, snapshot_ts=T0)
+    return (await redis.xadd(stream_name(venue), env.to_fields(), id=f"{now - age_ms}-0")).decode()
+
+
+async def test_backlog_is_zero_when_the_writer_has_acked_everything(redis):
+    now = await redis_now(redis)
+    await add_aged(redis, "deribit", 600_000, now)
+    consumer = StreamConsumer(redis, ["deribit"])
+    await consumer.ensure_groups()
+    for d in await consumer.read(block_ms=None):
+        await consumer.ack(d)
+    b = await writer_backlog(redis, ["deribit"])
+    assert (b.stream, b.age_ms, b.pending, b.undelivered) == ("ppm:deribit", 0, 0, 0)
+
+
+async def test_backlog_ages_an_undelivered_message_like_a_paused_writer(redis):
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit"]).ensure_groups()
+    await add_aged(redis, "deribit", 400_000, now)
+    await add_aged(redis, "deribit", 100_000, now)
+    b = await writer_backlog(redis, ["deribit"])
+    assert 400_000 <= b.age_ms < 400_000 + SLACK  # the oldest of the two counts
+    assert (b.pending, b.undelivered) == (0, 2)
+
+
+async def test_backlog_ages_a_delivered_but_unacked_message_like_a_stuck_writer(redis):
+    """The disk-full retry loop: delivered, never acked, newer ones still delivered."""
+    now = await redis_now(redis)
+    await add_aged(redis, "deribit", 500_000, now)
+    consumer = StreamConsumer(redis, ["deribit"])
+    await consumer.ensure_groups()
+    assert len(await consumer.read(block_ms=None)) == 1  # delivered, not acked
+    b = await writer_backlog(redis, ["deribit"])
+    assert 500_000 <= b.age_ms < 500_000 + SLACK
+    assert (b.pending, b.undelivered) == (1, 0)
+
+
+async def test_backlog_counts_from_the_start_when_the_writer_never_made_its_group(redis):
+    now = await redis_now(redis)
+    await add_aged(redis, "kalshi", 700_000, now)
+    b = await writer_backlog(redis, ["kalshi"])
+    assert 700_000 <= b.age_ms < 700_000 + SLACK
+    assert (b.stream, b.undelivered) == ("ppm:kalshi", None)
+
+
+async def test_backlog_skips_missing_streams_and_reports_the_worst_one(redis):
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit", "kalshi"]).ensure_groups()
+    await add_aged(redis, "deribit", 100_000, now)
+    await add_aged(redis, "kalshi", 900_000, now)
+    b = await writer_backlog(redis, ["deribit", "kalshi", "polymarket"])  # polymarket: none
+    assert b.stream == "ppm:kalshi" and 900_000 <= b.age_ms < 900_000 + SLACK
+    assert (await writer_backlog(redis, ["polymarket"])).age_ms == 0
+
+
+async def test_backlog_check_does_not_touch_the_writers_group(redis):
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit"]).ensure_groups()
+    await add_aged(redis, "deribit", 400_000, now)
+    before = await redis.xinfo_groups(stream_name("deribit"))
+    await writer_backlog(redis, ["deribit"])
+    assert await redis.xinfo_groups(stream_name("deribit")) == before
+
+
+def writer_monitor(redis, clock, **kw) -> Monitor:
+    return monitor(
+        redis,
+        clock,
+        venues=("deribit",),
+        writer_watch=WriterWatch(LAG, 12 * 3_600_000),
+        writer_venues=["deribit"],
+        **kw,
+    )
+
+
+def writer_events(events) -> list:
+    return [e for e in events if isinstance(e, WriterBehind) or getattr(e, "venue", "") == "writer"]
+
+
+async def test_monitor_alerts_once_on_writer_lag_then_recovers_and_throttles_checks(redis):
+    now = await redis_now(redis)
+    consumer = StreamConsumer(redis, ["deribit"])
+    await consumer.ensure_groups()
+    await add_aged(redis, "deribit", LAG + 10_000, now)
+    clock = FakeClock(T0)
+    m = writer_monitor(redis, clock)
+
+    first = writer_events(await m.step())
+    assert len(first) == 1 and isinstance(first[0], WriterBehind)
+    assert first[0].stream == "ppm:deribit" and first[0].undelivered == 1
+
+    # Writer catches up, but the next check is throttled to 5 s after the last one.
+    for d in await consumer.read(block_ms=None):
+        await consumer.ack(d)
+    clock.now = T0 + 4_999
+    assert writer_events(await m.step()) == []
+    clock.now = T0 + 5_000
+    back = writer_events(await m.step())
+    assert len(back) == 1 and back[0].kind == "writer-lag"
+    assert LAG + 10_000 <= back[0].down_for_ms < LAG + 10_000 + SLACK
+
+
+class FlakyPipelineRedis(FlakyRedis):
+    """FlakyRedis whose pipelines fail at `execute()` while down, which is where
+    redis-py raises a connection error (even with `raise_on_error=False`)."""
+
+    def pipeline(self, *a, **kw):
+        pipe = self._inner.pipeline(*a, **kw)
+        real_execute = pipe.execute
+
+        async def execute(*ea, **ekw):
+            if self.down:
+                raise redis_errors.ConnectionError("Connection refused")
+            return await real_execute(*ea, **ekw)
+
+        pipe.execute = execute
+        return pipe
+
+
+class DropsOnRead(FlakyPipelineRedis):
+    """Up for the writer check, down for the XREAD right after it, once."""
+
+    def __init__(self, inner) -> None:
+        super().__init__(inner)
+        self.drop_next_read = False
+
+    async def xread(self, *a, **kw):
+        if self.drop_next_read:
+            self.drop_next_read = False
+            raise redis_errors.ConnectionError("Connection reset")
+        return await self._inner.xread(*a, **kw)
+
+
+async def test_writer_alert_is_not_lost_when_redis_drops_between_check_and_read(redis):
+    """Review finding: judging before `read` set the watch to "behind" and then lost the
+    ALERT when `read` raised, so it was never sent. Judging after `read` keeps it."""
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit"]).ensure_groups()
+    await add_aged(redis, "deribit", LAG + 10_000, now)
+    flaky = DropsOnRead(redis)
+    clock = FakeClock(T0)
+    m = writer_monitor(flaky, clock)
+    await m.seed()
+    flaky.drop_next_read = True
+    events, ok = await m.poll_once()
+    assert not ok and writer_events(events) == []
+    clock.now = T0 + 5_000
+    events, ok = await m.poll_once()
+    assert ok and [type(e) for e in writer_events(events)] == [WriterBehind]
+
+
+async def test_a_backward_clock_step_does_not_stall_the_writer_check(redis):
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit"]).ensure_groups()
+    clock = FakeClock(T0)
+    m = writer_monitor(redis, clock)
+    assert writer_events(await m.step()) == []  # caught up; checked at T0
+    await add_aged(redis, "deribit", LAG + 10_000, now)
+    clock.now = T0 - 3_600_000  # NTP stepped the host clock back an hour
+    assert [type(e) for e in writer_events(await m.step())] == [WriterBehind]
+
+
+async def test_redis_outage_freezes_the_writer_watch(redis):
+    """While Redis is unreachable the monitor can't judge the writer: no writer ALERT and
+    no false RECOVERED, just the Redis alert. Judging resumes when Redis is back."""
+    now = await redis_now(redis)
+    await StreamConsumer(redis, ["deribit"]).ensure_groups()
+    await add_aged(redis, "deribit", LAG + 10_000, now)
+    flaky = FlakyPipelineRedis(redis)
+    clock = FakeClock(T0)
+    m = writer_monitor(flaky, clock)
+    events, ok = await m.poll_once()
+    assert ok and len(writer_events(events)) == 1
+
+    flaky.down = True
+    seen = []
+    for t in range(5_000, 125_000, 5_000):
+        clock.now = T0 + t
+        got, ok = await m.poll_once()
+        assert not ok
+        seen += got
+    assert writer_events(seen) == []
+    assert [type(e) for e in seen] == [RedisUnreachable]
+
+    flaky.down = False
+    clock.now = T0 + 130_000
+    events, ok = await m.poll_once()
+    assert ok and writer_events(events) == []  # still behind: no repeat, no recovery
+
+
+async def test_a_bug_in_the_writer_check_does_not_stop_venue_monitoring(redis, monkeypatch):
+    async def broken(*a, **kw):
+        raise KeyError("odd reply")
+
+    monkeypatch.setattr(service, "writer_backlog", broken)
+    clock = FakeClock(T0 + 1_000)
+    m = writer_monitor(redis, clock)
+    await m.seed()
+    await publish(redis, "deribit", T0)
+    await publish(redis, "deribit", T0 + 2 * TICK_MS)
+    clock.now = T0 + 2 * TICK_MS + 1_000
+    events, ok = await m.poll_once()
+    assert ok and [type(e) for e in events] == [Gap]
