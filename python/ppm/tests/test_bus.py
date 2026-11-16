@@ -110,6 +110,90 @@ async def test_queue_drained_waits_for_unread_and_unacked_messages(redis, make):
     assert await queue_drained(redis, ["deribit"])
 
 
+# --- waiting out the minute-tick burst (PLAN 2h) ---------------------------------------
+
+
+async def _pending_message(redis, make):
+    """One message the writer has been handed but not acked yet: the queue looks busy."""
+    consumer = StreamConsumer(redis, venues=["deribit"])
+    await consumer.ensure_groups()
+    await redis.xadd(stream_name("deribit"), make().to_fields())
+    (delivery,) = await consumer.read(block_ms=None)
+    return consumer, delivery
+
+
+async def test_wait_until_drained_sees_through_a_burst_at_the_check(redis, make):
+    """The VM bug: the check lands while a tick's messages are in flight. A single
+    snapshot says "busy" and the hour is skipped; waiting must see the queue drain."""
+    import asyncio
+
+    from ppm.pipeline.bus import queue_drained, wait_until_drained
+
+    consumer, delivery = await _pending_message(redis, make)
+    assert not await queue_drained(redis, ["deribit"])  # what the old one-shot check saw
+
+    async def writer_finishes_the_burst():
+        await asyncio.sleep(0.3)
+        await consumer.ack(delivery)
+
+    task = asyncio.create_task(writer_finishes_the_burst())
+    waited = await wait_until_drained(
+        redis, ["deribit"], window_ms=5_000, every_ms=50, stop=asyncio.Event()
+    )
+    await task
+    assert waited is not None
+    assert 250 <= waited < 2_000
+
+
+async def test_wait_until_drained_gives_up_on_a_stuck_queue(redis, make):
+    import asyncio
+    import time
+
+    from ppm.pipeline.bus import wait_until_drained
+
+    await _pending_message(redis, make)  # never acked: the writer is really behind
+    start = time.monotonic()
+    waited = await wait_until_drained(
+        redis, ["deribit"], window_ms=300, every_ms=50, stop=asyncio.Event()
+    )
+    assert waited is None
+    assert time.monotonic() - start < 2.0  # bounded by the window, not forever
+
+
+async def test_wait_until_drained_returns_at_once_on_an_empty_queue(redis):
+    import asyncio
+
+    from ppm.pipeline.bus import wait_until_drained
+
+    clock_calls = iter([1_000, 1_000])  # start, then the drained check: 0 ms waited
+    waited = await wait_until_drained(
+        redis,
+        ["deribit"],
+        window_ms=60_000,
+        every_ms=60_000,  # a sleep would make the test hang for a minute
+        stop=asyncio.Event(),
+        clock=lambda: next(clock_calls),
+    )
+    assert waited == 0
+
+
+async def test_wait_until_drained_stops_promptly(redis, make):
+    import asyncio
+    import time
+
+    from ppm.pipeline.bus import wait_until_drained
+
+    await _pending_message(redis, make)
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.1, stop.set)
+    start = time.monotonic()
+    waited = await wait_until_drained(
+        redis, ["deribit"], window_ms=60_000, every_ms=10_000, stop=stop
+    )
+    assert waited is None
+    assert time.monotonic() - start < 2.0
+
+
 # --- retention window -----------------------------------------------------------------
 
 

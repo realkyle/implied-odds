@@ -273,6 +273,12 @@ def _remove_empty(directory: Path) -> None:
         shutil.rmtree(directory)
 
 
+def overdue_ms(day: str, now_ms: int) -> int:
+    """How long past its grace period (D+1 02:00 UTC) `day` is at `now_ms`; negative
+    before then. The merge loop alerts when an unmerged day gets too far past it."""
+    return now_ms - _day_end_ms(day) - GRACE_MS
+
+
 def _day_end_ms(day: str) -> int:
     start = datetime.combine(date.fromisoformat(day), datetime.min.time(), tzinfo=UTC)
     return int((start + timedelta(days=1)).timestamp() * 1000)

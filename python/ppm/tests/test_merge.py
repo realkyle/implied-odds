@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from ppm.integrity.manifest import Manifest, sha256_file
 from ppm.tests.conftest import make_envelope
-from ppm.writer.merge import GRACE_MS, POLICIES, DailyMerger, DedupPolicy, dedup
+from ppm.writer.merge import GRACE_MS, POLICIES, DailyMerger, DedupPolicy, dedup, overdue_ms
 from ppm.writer.schemas import SCHEMAS
 from ppm.writer.storage import DataStore
 
@@ -181,3 +181,11 @@ def test_only_days_past_the_grace_period_are_merged(tmp_path):
     end_of_day = ms(2026, 11, 12)
     assert merger.pending_days(end_of_day + GRACE_MS - 1) == []
     assert merger.pending_days(end_of_day + GRACE_MS) == [DAY]
+
+
+def test_overdue_counts_from_the_grace_period():
+    end_of_day = ms(2026, 11, 12)  # DAY = 2026-11-11 ends here; grace runs to 02:00
+    hour, minute = 3_600_000, 60_000
+    assert overdue_ms(DAY, end_of_day + 2 * hour + 7 * minute) == 7 * minute  # 02:07 check
+    assert overdue_ms(DAY, end_of_day + GRACE_MS - 1) == -1
+    assert overdue_ms(DAY, end_of_day + 4 * hour + 7 * minute) == 2 * hour + 7 * minute

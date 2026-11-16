@@ -10,6 +10,7 @@ unreachable, then replays the spool in order once Redis is back.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 import os
@@ -21,6 +22,7 @@ from pathlib import Path
 from redis import exceptions as redis_errors
 from redis.asyncio import Redis
 
+from ppm.pipeline.clock import Clock, now_ms, sleep_until
 from ppm.pipeline.envelope import Envelope
 
 log = logging.getLogger(__name__)
@@ -243,3 +245,33 @@ async def queue_drained(redis: Redis, venues: list[str], group: str = WRITER_GRO
             if g.get("pending", 0) or g.get("lag", 0):
                 return False
     return True
+
+
+async def wait_until_drained(
+    redis: Redis,
+    venues: list[str],
+    *,
+    window_ms: int,
+    every_ms: int,
+    stop: asyncio.Event,
+    clock: Clock = now_ms,
+) -> int | None:
+    """Poll `queue_drained` until it says True; return the ms waited, or None if it never
+    did within `window_ms` (or `stop` was set).
+
+    Why poll instead of checking once: every recorder publishes in the first ~0.7 s of
+    each minute, so a single snapshot taken then sees a few messages the writer hasn't
+    finished yet, although the writer is keeping up. Three hourly checks on the VM landed
+    in that burst on 2026-11-16 and the day went unmerged. A healthy writer clears a burst
+    in well under a second, so one of the next polls sees an empty queue. A writer that
+    is really behind stays "not drained" for the whole window. The meaning of "drained"
+    (nothing pending, nothing undelivered) is unchanged; only the moment we look is.
+    """
+    start = clock()
+    while True:
+        if await queue_drained(redis, venues):
+            return clock() - start
+        if clock() - start >= window_ms or stop.is_set():
+            return None
+        if not await sleep_until(clock() + every_ms, stop, clock):
+            return None  # stop was set while sleeping
