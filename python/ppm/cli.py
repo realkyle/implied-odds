@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -24,6 +25,14 @@ from pathlib import Path
 import httpx
 from redis.asyncio import Redis
 
+from ppm.analysis.coverage import (
+    CoverageError,
+    compare,
+    load_store,
+    pinned_entries,
+    render,
+    to_json,
+)
 from ppm.backup.audit import S3VersionLister, VersionLister, audit
 from ppm.backup.check import check_permissions
 from ppm.backup.job import BackupJob, BackupRefused, BackupReport
@@ -382,6 +391,44 @@ def _verify(settings: Settings, expect_head: str | None) -> int:
     return 0
 
 
+def _coverage(
+    day: str, baseline: str, candidate: str, candidate_head: str, labels: str, json_out: str | None
+) -> int:
+    """Verify both stores, then compare their coverage of `day` (PLAN 2d1).
+
+    Exit 0 = the automatic part of the pass bar holds, 1 = the report says FAIL,
+    2 = can't compare (bad arguments, a store fails verification, day not merged);
+    the same convention as `ppm backup --status`.
+    """
+    names = labels.split(",")
+    if len(names) != 2 or not all(names):
+        print("--labels must be two names, e.g. laptop,vm", file=sys.stderr)
+        return 2
+    stores = ((names[0], Path(baseline), None), (names[1], Path(candidate), candidate_head))
+    entries: dict[str, list] = {}
+    for label, root, head in stores:
+        # Never compare data the chain doesn't vouch for; the candidate must also end
+        # at the head recorded independently (the restore printed it from S3).
+        entries[label], problems = pinned_entries(root, head)
+        for p in problems:
+            print(f"FAIL {label} seq={p.seq} path={p.path}: {p.message}")
+        if problems:
+            print(f"{label}: VERIFICATION FAILED, not comparing")
+            return 2
+        print(f"{label}: verified {root}" + (f" (head {head[:12]}…)" if head else ""))
+    try:
+        report = compare(
+            *(load_store(label, root, day, entries[label]) for label, root, _ in stores)
+        )
+    except CoverageError as exc:
+        print(f"coverage failed: {exc}", file=sys.stderr)
+        return 2
+    print(render(report))
+    if json_out:
+        Path(json_out).write_text(json.dumps(to_json(report), indent=2) + "\n")
+    return 1 if report.problems() else 0
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="ppm")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -412,6 +459,15 @@ def main(argv: list[str] | None = None) -> None:
     rst = sub.add_parser("restore", help="rebuild a data directory from the S3 backup")
     rst.add_argument("--to", required=True, help="new, empty directory to restore into")
     rst.add_argument("--seq", type=int, help="restore the chain as of this head (default newest)")
+    cov = sub.add_parser("coverage", help="compare two stores' tick coverage of one UTC day")
+    cov.add_argument("--date", required=True, help="UTC day, YYYY-MM-DD (merged in both stores)")
+    cov.add_argument("--baseline", required=True, help="data root of the baseline (laptop)")
+    cov.add_argument("--candidate", required=True, help="data root of the candidate (VM restore)")
+    cov.add_argument(
+        "--candidate-head", required=True, help="chain head the candidate must end at (from S3)"
+    )
+    cov.add_argument("--labels", default="laptop,vm", help="names for baseline,candidate")
+    cov.add_argument("--json", dest="json_out", help="also write a JSON summary here")
     flt = sub.add_parser("faulttest", help="failure test on an isolated ppmtest Compose stack")
     flt.add_argument(
         "--scenario",
@@ -441,6 +497,17 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(asyncio.run(_backup_status(settings)))
     elif args.command == "backup":
         sys.exit(asyncio.run(_backup(settings, args.loop, args.check_permissions)))
+    elif args.command == "coverage":
+        sys.exit(
+            _coverage(
+                args.date,
+                args.baseline,
+                args.candidate,
+                args.candidate_head,
+                args.labels,
+                args.json_out,
+            )
+        )
     elif args.command == "restore":
         sys.exit(_restore(settings, args.to, args.seq))
 
