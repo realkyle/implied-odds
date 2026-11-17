@@ -712,4 +712,17 @@ takes ~150 s on the VM and Docker kills the container 30 s after SIGTERM.
 so an NTP step during it stretches or shortens the 60 s. Both are harmless at hourly
 granularity.
 
-**Live result:** pending the first night after deploy (2026-11-17 ~02:07Z).
+**Live result (2026-11-17, first VM night after the 06:43Z 2026-11-16 deploy, no hand merge):**
+
+| Measure | Value |
+|---|---|
+| Merge start delay after 02:07:00Z | **≈ 1.5 s** (merge started 02:07:01.5Z) |
+| Of which polling until drained (`queue drained after X.X s`, counted from the first check at ~02:07:00.3) | **1.2 s** |
+| Merge of 2026-11-16 | **143.7 s**, 142410 files → 13 files, 497.9 MB, 13 manifest entries |
+| `ALERT kind=merge-overdue` lines (merger) | 0 |
+| `writer-lag` lines (monitor), whole run since deploy | 0 (the log starts at the container start, 06:43:38Z 2026-11-16, and holds only the 3 start-up lines; this is the deferred 2d2 "quiet during the 02:00 merge" check) |
+| Backup | head seq=38 `5a076b7668c6…` at 02:37:11Z, 13 files, 497.9 MB, 11.5 s |
+| VM `ppm verify` | 39 entries, head equal to the S3 head |
+
+The 1.2 s matches the cause: the one-shot check landed inside the 0.2–0.7 s publish burst,
+and polling for one more second gets past it.
